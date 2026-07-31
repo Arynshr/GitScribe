@@ -1,8 +1,10 @@
 """
 Shared state object passed between all LangGraph nodes.
 """
+
+from typing import Literal
+
 from pydantic import BaseModel, Field
-from typing import Literal, Optional
 
 
 class RetrievedPR(BaseModel):
@@ -23,7 +25,7 @@ class GitScribeState(BaseModel):
     change_summary: list[str] = Field(default_factory=list)
 
     # --- risk classification (agentic node) ---
-    risk_score: float = 1.0                
+    risk_score: float = 1.0
     risk_reasoning: str = ""
     skip_generation: bool = False
 
@@ -39,8 +41,8 @@ class GitScribeState(BaseModel):
 
     # --- failure handling (agentic router) ---
     attempt_count: int = 0
-    last_error: Optional[str] = None
-    failure_type: Optional[Literal["rate_limit", "bad_output", "timeout", "none"]] = None
+    last_error: str | None = None
+    failure_type: Literal["rate_limit", "bad_output", "timeout", "none"] | None = None
     fallback_used: bool = False
 
     # --- output ---

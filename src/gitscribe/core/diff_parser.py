@@ -2,6 +2,7 @@
 Deterministic node: extracts and filters git diff.
 No LLM involved — pure git + heuristics, per README's diff intelligence layer.
 """
+
 import fnmatch
 import subprocess
 
@@ -12,8 +13,7 @@ IGNORE_PATTERNS = ["*.lock", "package-lock.json", "*.min.js", "poetry.lock"]
 
 def get_raw_diff(base: str = "origin/main", head: str = "HEAD") -> str:
     result = subprocess.run(
-        ["git", "diff", f"{base}...{head}"],
-        capture_output=True, text=True, check=True
+        ["git", "diff", f"{base}...{head}"], capture_output=True, text=True, check=True
     )
     return result.stdout
 
@@ -21,14 +21,17 @@ def get_raw_diff(base: str = "origin/main", head: str = "HEAD") -> str:
 def get_commit_messages(base: str = "origin/main", head: str = "HEAD") -> list[str]:
     result = subprocess.run(
         ["git", "log", f"{base}..{head}", "--pretty=format:%s"],
-        capture_output=True, text=True, check=True
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
 def filter_ignored_files(files: list[str]) -> list[str]:
     return [
-        f for f in files
+        f
+        for f in files
         if not any(fnmatch.fnmatch(f, pattern) for pattern in IGNORE_PATTERNS)
     ]
 
@@ -40,8 +43,7 @@ def extract_files_changed(diff_text: str) -> list[str]:
             parts = line.split()
             if len(parts) >= 4:
                 path = parts[3]
-                if path.startswith("b/"):
-                    path = path[2:]
+                path = path.removeprefix("b/")
                 files.append(path)
     return files
 
