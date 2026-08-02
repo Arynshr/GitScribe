@@ -5,11 +5,11 @@ can't tell a 3-line config edit from a critical security fix).
 """
 
 # Third-party imports
+# Local imports
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 
-# Local imports
 from core.state import GitScribeState
 
 RISK_PROMPT = ChatPromptTemplate.from_template(
@@ -38,17 +38,22 @@ def risk_classifier_node(state: GitScribeState, cfg: dict) -> dict:
 
     chain = build_risk_chain(cfg["llm"]["model"])
     try:
-        result = chain.invoke({
-            "files_changed": state.files_changed,
-            "change_summary": state.change_summary,
-            "commit_messages": state.commit_messages,
-        })
+        result = chain.invoke(
+            {
+                "files_changed": state.files_changed,
+                "change_summary": state.change_summary,
+                "commit_messages": state.commit_messages,
+            }
+        )
         risk_score = float(result["risk_score"])
         reasoning = result.get("reasoning", "")
     except Exception as e:
         # fail open: if classifier breaks, don't block generation
-        return {"risk_score": 1.0, "risk_reasoning": f"classifier_error: {e}",
-                "skip_generation": False}
+        return {
+            "risk_score": 1.0,
+            "risk_reasoning": f"classifier_error: {e}",
+            "skip_generation": False,
+        }
 
     threshold = cfg["risk_classifier"]["trivial_threshold"]
     return {

@@ -2,6 +2,7 @@
 Deterministic node: extracts and filters git diff.
 No LLM involved — pure git + heuristics, per README's diff intelligence layer.
 """
+
 import subprocess
 from pathlib import Path
 
@@ -13,7 +14,9 @@ from core.state import GitScribeState
 DEFAULT_IGNORE_PATTERNS = ["*.lock", "package-lock.json", "*.min.js", "poetry.lock"]
 
 
-def load_ignore_spec(repo_root: str = ".", extra_patterns: list[str] | None = None) -> pathspec.PathSpec:
+def load_ignore_spec(
+    repo_root: str = ".", extra_patterns: list[str] | None = None
+) -> pathspec.PathSpec:
     """Build a gitignore-aware matcher from .gitignore + config-supplied extras."""
     gitignore_path = Path(repo_root) / ".gitignore"
     lines = []
@@ -30,8 +33,7 @@ def load_ignore_spec(repo_root: str = ".", extra_patterns: list[str] | None = No
 
 def get_raw_diff(base: str = "origin/main", head: str = "HEAD") -> str:
     result = subprocess.run(
-        ["git", "diff", f"{base}...{head}"],
-        capture_output=True, text=True, check=True
+        ["git", "diff", f"{base}...{head}"], capture_output=True, text=True, check=True
     )
     return result.stdout
 
@@ -39,7 +41,9 @@ def get_raw_diff(base: str = "origin/main", head: str = "HEAD") -> str:
 def get_commit_messages(base: str = "origin/main", head: str = "HEAD") -> list[str]:
     result = subprocess.run(
         ["git", "log", f"{base}..{head}", "--pretty=format:%s"],
-        capture_output=True, text=True, check=True
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return [line for line in result.stdout.splitlines() if line.strip()]
 
@@ -55,8 +59,7 @@ def extract_files_changed(diff_text: str) -> list[str]:
             parts = line.split()
             if len(parts) >= 4:
                 path = parts[3]
-                if path.startswith("b/"):
-                    path = path[2:]
+                path = path.removeprefix("b/")
                 files.append(path)
     return files
 
