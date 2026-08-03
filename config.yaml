@@ -1,0 +1,25 @@
+llm:
+  provider: groq
+  model: llama-3.3-70b-versatile
+  fallback_model: llama-3.1-8b-instant
+  temperature: 0.2
+  max_tokens: 1000
+
+retrieval:
+  min_prs: 3
+  max_prs: 10
+  branch_prefix_match: true
+
+risk_classifier:
+  enabled: true
+  trivial_threshold: 0.15 # if a diff scores below this, skip LLM generation entirely (template fallback)
+
+failure_handling:
+  max_retries: 2
+  retry_backoff_seconds: 2
+
+ignore_patterns:
+  - "*.lock"
+  - "package-lock.json"
+  - "*.min.js"
+  - "poetry.lock"
