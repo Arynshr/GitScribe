@@ -2,12 +2,30 @@
 Deterministic node: extracts and filters git diff.
 No LLM involved — pure git + heuristics, per README's diff intelligence layer.
 """
-import fnmatch
 import subprocess
+from pathlib import Path
 
-from core.state import GitScribeState
+import pathspec
 
-IGNORE_PATTERNS = ["*.lock", "package-lock.json", "*.min.js", "poetry.lock"]
+from gitscribe.core.state import GitScribeState
+
+# fallback patterns used only if no .gitignore exists / repo has none of these listed
+DEFAULT_IGNORE_PATTERNS = ["*.lock", "package-lock.json", "*.min.js", "poetry.lock"]
+
+
+def load_ignore_spec(repo_root: str = ".", extra_patterns: list[str] | None = None) -> pathspec.PathSpec:
+    """Build a gitignore-aware matcher from .gitignore + config-supplied extras."""
+    gitignore_path = Path(repo_root) / ".gitignore"
+    lines = []
+    if gitignore_path.exists():
+        lines = gitignore_path.read_text().splitlines()
+
+    if extra_patterns:
+        lines.extend(extra_patterns)
+    if not lines:
+        lines = DEFAULT_IGNORE_PATTERNS
+
+    return pathspec.PathSpec.from_lines("gitignore", lines)
 
 
 def get_raw_diff(base: str = "origin/main", head: str = "HEAD") -> str:
@@ -26,11 +44,8 @@ def get_commit_messages(base: str = "origin/main", head: str = "HEAD") -> list[s
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
-def filter_ignored_files(files: list[str]) -> list[str]:
-    return [
-        f for f in files
-        if not any(fnmatch.fnmatch(f, pattern) for pattern in IGNORE_PATTERNS)
-    ]
+def filter_ignored_files(files: list[str], spec: pathspec.PathSpec) -> list[str]:
+    return [f for f in files if not spec.match_file(f)]
 
 
 def extract_files_changed(diff_text: str) -> list[str]:
@@ -46,13 +61,14 @@ def extract_files_changed(diff_text: str) -> list[str]:
     return files
 
 
-def diff_parser_node(state: GitScribeState) -> dict:
+def diff_parser_node(state: GitScribeState, cfg: dict) -> dict:
     """LangGraph node: returns partial update with raw_diff, commit_messages, files_changed."""
     raw_diff = state.raw_diff or get_raw_diff()
     commit_messages = state.commit_messages or get_commit_messages()
 
     files = extract_files_changed(raw_diff)
-    files = filter_ignored_files(files)
+    spec = load_ignore_spec(extra_patterns=cfg.get("ignore_patterns", []))
+    files = filter_ignored_files(files, spec)
 
     return {
         "raw_diff": raw_diff,

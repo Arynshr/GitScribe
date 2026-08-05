@@ -1,0 +1,14 @@
+CREATE TABLE IF NOT EXISTS prs (
+  id INTEGER PRIMARY KEY,
+  branch TEXT,
+  title TEXT,
+  body TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS commits (
+  hash TEXT PRIMARY KEY,
+  message TEXT,
+  pr_id INTEGER,
+  FOREIGN KEY (pr_id) REFERENCES prs(id)
+);
