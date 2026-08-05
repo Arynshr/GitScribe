@@ -7,8 +7,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 from pydantic import BaseModel, Field
 
-from core.state import GitScribeState
-from core.telemetry import timed_llm_call
+from gitscribe.core.state import GitScribeState
+from gitscribe.core.telemetry import timed_llm_call
 
 
 class PRDescription(BaseModel):

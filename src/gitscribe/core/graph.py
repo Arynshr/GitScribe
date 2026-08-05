@@ -19,13 +19,13 @@ import time
 
 from langgraph.graph import END, StateGraph
 
-from core.diff_parser import diff_parser_node
-from core.failure_router import failure_router_node, route_after_failure
-from core.generator import generator_node
-from core.retriever import retriever_node
-from core.risk_classifier import risk_classifier_node, route_after_risk
-from core.state import GitScribeState
-from core.summarizer import summarizer_node
+from gitscribe.core.diff_parser import diff_parser_node
+from gitscribe.core.failure_router import failure_router_node, route_after_failure
+from gitscribe.core.generator import generator_node
+from gitscribe.core.retriever import retriever_node
+from gitscribe.core.risk_classifier import risk_classifier_node, route_after_risk
+from gitscribe.core.state import GitScribeState
+from gitscribe.core.summarizer import summarizer_node
 
 
 def template_fallback_node(state: GitScribeState) -> dict:

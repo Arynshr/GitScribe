@@ -9,7 +9,7 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
-from gitscribe.core.memory import memory
+from gitscribe.core import memory
 from gitscribe.core.config_schema import GitScribeConfig
 from gitscribe.core.graph import build_graph
 

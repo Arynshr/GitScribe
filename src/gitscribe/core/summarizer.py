@@ -5,7 +5,7 @@ Reduces token usage ~70-90% before anything touches the LLM.
 
 import re
 
-from core.state import GitScribeState
+from gitscribe.core.state import GitScribeState
 
 
 def summarize_diff(files_changed: list[str], raw_diff: str) -> list[str]:

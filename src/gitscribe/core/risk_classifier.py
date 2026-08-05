@@ -10,7 +10,7 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 
-from core.state import GitScribeState
+from gitscribe.core.state import GitScribeState
 
 RISK_PROMPT = ChatPromptTemplate.from_template(
     """You are a senior engineer triaging a code change.

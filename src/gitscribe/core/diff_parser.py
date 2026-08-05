@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pathspec
 
-from core.state import GitScribeState
+from gitscribe.core.state import GitScribeState
 
 # fallback patterns used only if no .gitignore exists / repo has none of these listed
 DEFAULT_IGNORE_PATTERNS = ["*.lock", "package-lock.json", "*.min.js", "poetry.lock"]

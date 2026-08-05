@@ -1,7 +1,7 @@
 """
 Agentic node #4: failure-recovery routing.
 """
-from core.state import GitScribeState
+from gitscribe.core.state import GitScribeState
 
 
 def classify_failure(error_msg: str) -> str:

@@ -4,7 +4,7 @@ from unittest.mock import patch
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
 from gitscribe.core.generator import generator_node
-from gitscibe.core.state import GitScribeState
+from gitscribe.core.state import GitScribeState
 
 FAKE_PR_JSON = json.dumps({
     "title": "Add user auth",
