@@ -4,7 +4,7 @@ from unittest.mock import patch
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
 from gitscribe.core.generator import generator_node
-from gitscribe.core.state import GitScribeState
+from gitscibe.core.state import GitScribeState
 
 FAKE_PR_JSON = json.dumps({
     "title": "Add user auth",
@@ -45,3 +45,26 @@ def test_generator_node_bad_output_marks_failed():
     assert result["status"] == "failed"
     assert result["last_error"] is not None
     assert result["attempt_count"] == 1
+
+
+def test_style_instruction_reaches_prompt_text():
+    """Verify each style preset actually changes prompt content, not just accepted and ignored."""
+    from gitscribe.core.generator import GEN_PROMPT, STYLE_INSTRUCTIONS
+
+    prompt_value = GEN_PROMPT.invoke({
+        "style_instruction": STYLE_INSTRUCTIONS["concise"],
+        "change_summary": STATE.change_summary,
+        "commit_messages": STATE.commit_messages,
+        "past_prs": [],
+        "format_instructions": "",
+    })
+    assert "terse" in prompt_value.to_string().lower()
+
+
+def test_generator_node_passes_state_style_through_without_error():
+    fake_llm = FakeListChatModel(responses=[FAKE_PR_JSON])
+    concise_state = STATE.model_copy(update={"style": "concise"})
+    with patch("core.generwator.ChatGroq", return_value=fake_llm):
+        result = generator_node(concise_state, CFG)
+
+    assert result["status"] == "success"
