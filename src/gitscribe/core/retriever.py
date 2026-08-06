@@ -5,9 +5,9 @@ Fixed 'last N PRs' fails on monorepos (irrelevant noise) and sparse repos
 """
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
 
 from gitscribe.core import memory
+from gitscribe.core.llm_client import build_chat_model
 from gitscribe.core.state import GitScribeState
 
 RELEVANCE_PROMPT = ChatPromptTemplate.from_template(
@@ -38,7 +38,7 @@ def retriever_node(state: GitScribeState, cfg: dict) -> dict:
     stopped_reason = "min_prs_default"
 
     if cfg["risk_classifier"]["enabled"]:
-        llm = ChatGroq(model=cfg["llm"]["model"], temperature=0)
+        llm = build_chat_model(cfg, cfg["llm"]["model"], temperature=0)
         chain = RELEVANCE_PROMPT | llm | JsonOutputParser()
 
         max_iterations = 2

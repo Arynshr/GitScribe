@@ -4,9 +4,9 @@ This is the README's core 'chain' — no agent behavior, single call.
 """
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
 from pydantic import BaseModel, Field
 
+from gitscribe.core.llm_client import build_chat_model
 from gitscribe.core.state import GitScribeState
 from gitscribe.core.telemetry import timed_llm_call
 
@@ -51,7 +51,7 @@ def generator_node(state: GitScribeState, cfg: dict) -> dict:
         else cfg["llm"]["fallback_model"]
     style_instruction = STYLE_INSTRUCTIONS.get(state.style, STYLE_INSTRUCTIONS["default"])
 
-    llm = ChatGroq(model=model_name, temperature=cfg["llm"]["temperature"])
+    llm = build_chat_model(cfg, model_name, temperature=cfg["llm"]["temperature"])
     prompt_value = GEN_PROMPT.invoke({
         "style_instruction": style_instruction,
         "change_summary": state.change_summary,

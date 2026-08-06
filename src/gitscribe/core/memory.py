@@ -8,7 +8,7 @@ from pathlib import Path
 DB_PATH = Path.cwd() / "Storage" / "gitscribe.db"
 
 SCHEMA = """
-CREATE TABLE IF NOT EXIST prs (
+CREATE TABLE IF NOT EXISTS prs (
     id  INTEGER PRIMARY KEY,
     branch,
     title,
@@ -28,6 +28,7 @@ def get_connection() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
     return conn
 
 

@@ -1,3 +1,4 @@
+import os
 import shutil
 import stat
 import subprocess
@@ -6,16 +7,19 @@ from pathlib import Path
 
 import typer
 import yaml
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from pydantic import ValidationError
 
 from gitscribe.core import memory
 from gitscribe.core.config_schema import GitScribeConfig
 from gitscribe.core.graph import build_graph
 
-load_dotenv()
+# usecwd=True: resolve relative to where the command is run, not cli.py's own
+load_dotenv(find_dotenv(usecwd=True))
 
 app = typer.Typer(help="GitScribe: stateful PR description generator (LangGraph-powered)")
+
+ENV_PATH = Path(".env")
 
 
 class Style(StrEnum):
@@ -55,6 +59,18 @@ def is_gh_authenticated() -> bool:
     return result.returncode == 0
 
 
+def require_api_key() -> None:
+    """Fail fast with a clear message before invoking the graph, rather than
+    letting a missing key surface as an opaque provider auth error mid-run."""
+    if not os.environ.get("API_KEY"):
+        typer.secho(
+            "[gitscribe] API_KEY not set. Run `gitscribe init` or "
+            "`export API_KEY=<your-key>`.",
+            err=True, fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+
+
 @app.command()
 def init():
     """Install the pre-push git hook into .git/hooks/."""
@@ -80,6 +96,27 @@ def init():
     dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
     typer.echo(f"[gitscribe] installed pre-push hook at {dest}")
 
+    _ensure_api_key()
+
+
+def _ensure_api_key() -> None:
+    """Write API_KEY to .env if not already available"""
+    load_dotenv(ENV_PATH)
+    if os.environ.get("API_KEY"):
+        typer.echo("[gitscribe] API_KEY already set - leaving .env untouched")
+        return
+
+    api_key = typer.prompt("Enter your LLM API key (provider is set in config.yaml)", hide_input=True)
+    if not api_key.strip():
+        typer.secho("[gitscribe] no key entered - skipping .env write", err=True, fg=typer.colors.YELLOW)
+        return
+
+    existing = ENV_PATH.read_text() if ENV_PATH.exists() else ""
+    lines = [ln for ln in existing.splitlines() if ln and not ln.startswith("API_KEY=")]
+    lines.append(f"API_KEY={api_key}")
+    ENV_PATH.write_text("\n".join(lines) + "\n")
+    typer.echo(f"[gitscribe] wrote API_KEY to {ENV_PATH.resolve()}")
+
 
 @app.command()
 def generate(
@@ -87,6 +124,7 @@ def generate(
     style: Style = typer.Option(Style.default, "--style", help="Style preset for the generated description"),
 ):
     """Generate a PR description for the current branch's diff."""
+    require_api_key()
     config = load_config()
     graph = build_graph(config)
 
@@ -134,6 +172,7 @@ def create_pr(
         )
         raise typer.Exit(1)
 
+    require_api_key()
     config = load_config()
     graph = build_graph(config)
     result = graph.invoke({

@@ -9,6 +9,7 @@ class LLMConfig(BaseModel):
     provider: str = "groq"
     model: str
     fallback_model: str
+    base_url: str | None = None
     temperature: float = Field(ge=0.0, le=2.0, default=0.2)
     max_tokens: int = Field(gt=0, default=1000)
 
