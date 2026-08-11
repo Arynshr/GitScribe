@@ -1,5 +1,9 @@
 """
 core/indexer/index_store.py
+Stage 2, Step 5: public API for the code index. This is the ONLY module
+Stage 3 (RAG/analysis) and Stage 4 (CLI: `gitscribe index/query/graph`)
+should import from — parser/graph_builder/embedder stay internal.
+
 Typed request/response models (Pydantic), consistent with state.py's
 pattern — not raw dicts across the public boundary.
 """
@@ -39,6 +43,7 @@ def _get_connection() -> sqlite3.Connection:
     INDEX_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(INDEX_DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -49,9 +54,12 @@ def init_schema() -> None:
     conn.close()
 
 
-def rebuild_index(repo_root: str, cfg: dict) -> None:
+def rebuild_index(repo_root: str, cfg: dict) -> str | None:
     """Full rebuild per run (Stage 2 policy). Wipes and re-populates
     symbols/edges/embeddings — cascade deletes keep it consistent.
+    Returns a warning string if embeddings were skipped (e.g. missing
+    optional dependency); None on full success. Symbols/edges are usable
+    either way — only `search()` depends on embeddings existing.
     """
     symbols = parse_repo(repo_root)
 
@@ -78,16 +86,27 @@ def rebuild_index(repo_root: str, cfg: dict) -> None:
     conn.commit()
 
     embeddable = [(sid, sym) for sid, sym in symbols_with_ids if sym.kind in ("function", "class", "method")]
+    embedding_error: str | None = None
     if embeddable:
-        vectors = embed_symbols([s for _, s in embeddable], cfg)
-        model_name = cfg.get("embedding", {}).get("model", "all-MiniLM-L6-v2")
-        conn.executemany(
-            "INSERT INTO embeddings (symbol_id, vector, model) VALUES (?, ?, ?)",
-            [(sid, vector_to_blob(vec), model_name) for (sid, _), vec in zip(embeddable, vectors)],
-        )
-        conn.commit()
+        try:
+            vectors = embed_symbols([s for _, s in embeddable], cfg)
+            model_name = cfg.get("embedding", {}).get("model", "all-MiniLM-L6-v2")
+            conn.executemany(
+                "INSERT INTO embeddings (symbol_id, vector, model) VALUES (?, ?, ?)",
+                [(sid, vector_to_blob(vec), model_name) for (sid, _), vec in zip(embeddable, vectors)],
+            )
+            conn.commit()
+        except ImportError as e:
+            # Symbols/edges are already committed above — graph/blast_radius
+            # stay fully usable. Only `search()` (RAG query) needs embeddings,
+            # so this degrades gracefully rather than failing the whole index.
+            embedding_error = (
+                f"Embeddings skipped: {e}. Install the embedding extra "
+                "(e.g. `pip install sentence-transformers`) to enable `gitscribe query`."
+            )
 
     conn.close()
+    return embedding_error
 
 
 def search(query: str, cfg: dict, top_k: int = 10) -> list[SearchResult]:
