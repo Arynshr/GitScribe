@@ -1,5 +1,7 @@
 """
-AST-based symbol extraction
+core/indexer/parser.py
+Stage 2, Step 1: AST-based symbol extraction. Python-only, stdlib `ast`.
+Output to stdout only — no storage, no graph yet.
 """
 
 from __future__ import annotations
@@ -21,13 +23,19 @@ class Symbol(BaseModel):
     file: str
     lineno: int
     end_lineno: int | None = None
-    parent: str | None = None 
-    calls: list[str] = Field(default_factory=list)
+    parent: str | None = None  # class name, if kind == "method"
+    calls: list[str] = Field(default_factory=list)  # raw call names, resolved later in graph_builder
+    bases: list[str] = Field(default_factory=list)  # raw base-class names, kind == "class" only
 
 
 class SymbolVisitor(ast.NodeVisitor):
     """Walks a single module's AST and collects symbols.
+
     Scope rule: methods are recorded with `parent` set to the enclosing
+    class name so graph_builder can later scope call resolution correctly.
+    Nested functions (defined inside another function) are recorded but
+    not treated as top-level embeddable symbols — kept for completeness
+    only, per the "track but don't embed" decision.
     """
 
     def __init__(self, file_path: str):
@@ -45,6 +53,7 @@ class SymbolVisitor(ast.NodeVisitor):
                 lineno=node.lineno,
                 end_lineno=getattr(node, "end_lineno", None),
                 parent=self._class_stack[-1] if self._class_stack else None,
+                bases=self._extract_bases(node),
             )
         )
         self._class_stack.append(node.name)
@@ -105,6 +114,16 @@ class SymbolVisitor(ast.NodeVisitor):
                     end_lineno=getattr(node, "end_lineno", None),
                 )
             )
+
+    @staticmethod
+    def _extract_bases(node: ast.ClassDef) -> list[str]:
+        bases = []
+        for b in node.bases:
+            if isinstance(b, ast.Name):
+                bases.append(b.id)
+            elif isinstance(b, ast.Attribute):
+                bases.append(b.attr)
+        return bases
 
     @staticmethod
     def _extract_calls(node: ast.AST) -> list[str]:
