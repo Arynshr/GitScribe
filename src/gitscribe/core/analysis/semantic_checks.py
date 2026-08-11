@@ -1,8 +1,9 @@
 """
 core/analysis/semantic_checks.py
-Structural signal from the code graph — cycles, dead code
+Stage 3: structural signal from the code graph — cycles, dead code
 (via reachability), high fan-in/out. Consumes index_store's public API
-only (no direct DB access)
+only (no direct DB access) — keeps this module decoupled from schema
+changes in the indexer.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from gitscribe.core.indexer.index_store import INDEX_DB_PATH
 
 
 class CycleFinding(BaseModel):
-    symbols: list[str]  
+    symbols: list[str]  # names, in cycle order
 
 
 class DeadCodeFinding(BaseModel):
@@ -64,6 +65,9 @@ def find_cycles(max_depth: int = 6) -> list[CycleFinding]:
     seen_sets = set()
     for row in rows:
         ids = [int(x) for x in row["trail"].split(",")]
+        ids = ids[:-1]  # trail always loops back to the start node (trail[0] == trail[-1]);
+                        # drop the redundant closing entry so a 2-node cycle reads
+                        # ['a', 'b'] not ['a', 'b', 'a'], and a self-loop reads ['a'] not ['a', 'a']
         key = frozenset(ids)
         if key in seen_sets:
             continue
