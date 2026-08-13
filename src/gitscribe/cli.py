@@ -1,8 +1,7 @@
+import json
 import os
 import shutil
 import stat
-import sys
-import json
 import subprocess
 from enum import StrEnum
 from pathlib import Path
@@ -13,10 +12,10 @@ from dotenv import find_dotenv, load_dotenv
 from pydantic import ValidationError
 
 from gitscribe.core import memory
-from gitscribe.core.config_schema import GitScribeConfig
-from gitscribe.core.graph import build_graph
 from gitscribe.core.analysis import linter as linter_mod
 from gitscribe.core.analysis.rag import retrieve
+from gitscribe.core.config_schema import GitScribeConfig
+from gitscribe.core.graph import build_graph
 from gitscribe.core.indexer import index_store
 
 # usecwd=True: resolve relative to where the command is run, not cli.py's own
@@ -34,7 +33,13 @@ class Style(StrEnum):
 
 
 def load_config(path: str = "config.yaml") -> dict:
-    """Load and validate config.yaml. Fails fast with a clear message on bad config."""
+    """Load and validate config.yaml, returning a plain dict.
+
+    Fails fast with a clear message on bad config. Returns
+    `GitScribeConfig.as_dict()` directly — callers should use the
+    returned value as-is; it is already a dict, not a `GitScribeConfig`
+    instance, so it does NOT have an `.as_dict()` method of its own.
+    """
     try:
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
@@ -98,7 +103,11 @@ def init():
         return
 
     shutil.copy(src, dest)
-    dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
+    # os.name check keeps this a no-op (harmless) on platforms where chmod
+    # bits aren't meaningful (e.g. some Windows filesystems); on POSIX
+    # (Linux/macOS) it makes the hook executable as before.
+    if os.name == "posix":
+        dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
     typer.echo(f"[gitscribe] installed pre-push hook at {dest}")
 
     _ensure_api_key()
@@ -200,65 +209,69 @@ def create_pr(
 
     memory.save_pr(result["branch_name"], result["pr_title"], result["pr_body"])
 
+
 @app.command()
 def index(
-    repo_root: str = typer.Option(".", help = "Repo root to index"),
-    json_output: bool = typer.Option(False, "--json", help = "Machine-readable output"),
+    repo_root: str = typer.Option(".", help="Repo root to index"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output"),
 ):
     """Build/refresh the code graph + embeddings. Full rebuild per run
     (Stage 2 policy) — safe to re-run any time.
     """
-    config = load_config()
+    config = load_config()  # already a dict — see load_config() docstring
     index_store.init_schema()
-    warning = index_store.rebuild_index(repo_root, config.as_dict())
-    
+    warning = index_store.rebuild_index(repo_root, config)  # P0 FIX: was config.as_dict()
+
     conn = index_store._get_connection()
     symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
     edge_count = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
     resolved_count = conn.execute("SELECT COUNT(*) FROM edges WHERE resolved = 1").fetchone()[0]
     conn.close()
-    
+
     stats = {"symbols": symbol_count, "edges": edge_count, "resolved_edges": resolved_count}
-    
+
     if json_output:
         typer.echo(json.dumps({**stats, "warning": warning}))
     else:
         typer.echo(f"Indexed {symbol_count} symbols, {edge_count} edges ({resolved_count} resolved).")
-        if warning: 
-                typer.echo(warning, err= True)
-                
+        if warning:
+            typer.echo(warning, err=True)
+
+
 @app.command()
 def query(
-    text: str = typer.Argument(..., help = "Natural language query"),
-    top_k: int = typer.Option(5, help = "Number of matches"),
+    text: str = typer.Argument(..., help="Natural language query"),
+    top_k: int = typer.Option(5, help="Number of matches"),
     json_output: bool = typer.Option(False, "--json"),
 ):
     """Retrieval over the indexed codebase."""
-    config = load_config()
-    context = retrieve(text, config.as_dict(), top_k = top_k)
+    config = load_config()  # already a dict — see load_config() docstring
+    context = retrieve(text, config, top_k=top_k)  # P0 FIX: was config.as_dict()
     if json_output:
         typer.echo(context.model_dump_json())
     else:
         typer.echo(context.as_prompt_block())
-        
+
+
 @app.command()
 def lint(
-    repo_root: str = typer.Option(".", help = "Repo root to lint"),
+    repo_root: str = typer.Option(".", help="Repo root to lint"),
     json_output: bool = typer.Option(False, "--json"),
-    fails_on_error: bool = typer.Option(True, help = "Exit 1 if any error-serverity finding exists"),
+    fails_on_error: bool = typer.Option(True, help="Exit 1 if any error-severity finding exists"),
 ):
     findings = linter_mod.run_ruff(repo_root)
-    
+
     if json_output:
         typer.echo(json.dumps([f.model_dump() for f in findings]))
     else:
         for f in findings:
             typer.echo(f"{f.severity:8} {f.file}:{f.lineno}  {f.code}  {f.message}")
         typer.echo(f"\n{len(findings)} findings, severity score {linter_mod.severity_score(findings):.2f}")
-        
-    has_errors = any( f.severity == "error" for f in findings)
+
+    has_errors = any(f.severity == "error" for f in findings)
     if fails_on_error and has_errors:
         raise typer.Exit(code=1)
+
 
 @app.command()
 def graph(
@@ -270,27 +283,27 @@ def graph(
     conn = index_store._get_connection()
     rows = conn.execute("SELECT id, name, file FROM symbols WHERE name = ?", (symbol,)).fetchall()
     conn.close()
- 
+
     if not rows:
         typer.echo(f"No symbol named '{symbol}' found. Run `gitscribe index` first?", err=True)
         raise typer.Exit(code=1)
- 
+
     if len(rows) > 1:
         typer.echo(f"Ambiguous symbol '{symbol}' — found in multiple files:", err=True)
         for r in rows:
             typer.echo(f"  {r['file']}", err=True)
         typer.echo("Re-run with the exact symbol; disambiguation by file not yet supported.", err=True)
         raise typer.Exit(code=1)
- 
+
     symbol_id = rows[0]["id"]
     results = index_store.blast_radius(symbol_id, max_depth=depth)
- 
+
     if json_output:
         typer.echo(json.dumps([r.model_dump() for r in results]))
     else:
         typer.echo(f"Blast radius for '{symbol}' (depth {depth}):")
         for r in results:
-            typer.echo(f"  [{r.depth}] {r.name} ({r.file})")
+            typer.echo(f"  [{r.direction:6} depth={r.depth}] {r.name} ({r.file}:{r.lineno})")
 
 
 if __name__ == "__main__":
