@@ -1,6 +1,8 @@
 """
 core/analysis/rag.py
 Query -> embed -> vector search -> graph-expand -> assembled
+context. Replaces/augments today's branch-prefix PR retrieval with
+code-aware context.
 """
 
 from __future__ import annotations
@@ -55,9 +57,33 @@ def retrieve(query: str, cfg: dict, top_k: int = 5, expand_depth: int = 1) -> RA
                     symbol_id=related.symbol_id,
                     name=related.name,
                     file=related.file,
-                    lineno=related.lineno,
-                    relation=related.direction,
+                    lineno=related.lineno, 
+                    relation=related.direction, 
                 )
             )
 
     return RAGContext(query=query, snippets=snippets)
+
+
+_SYNTHESIS_PROMPT = (
+    "Answer the question using ONLY the code context below. Cite the specific "
+    "symbol name(s) and file:line for anything you state. If the context doesn't "
+    "contain enough information to answer, say so plainly instead of guessing.\n\n"
+    "{context_block}\n\n"
+    "Question: {query}"
+)
+
+
+def answer_query(query: str, context: RAGContext, cfg: dict):
+    """Synthesizes a natural-language answer to `query`, grounded strictly in
+    the already-retrieved `context` — this is the step that was missing
+    before: `retrieve()` alone only returns raw matches, never an answer.
+    """
+    from gitscribe.core.llm_client import build_chat_model
+
+    model_name = cfg.get("llm", {}).get("model", "llama-3.3-70b-versatile")
+    model = build_chat_model(cfg, model_name=model_name, temperature=0.1)
+
+    prompt = _SYNTHESIS_PROMPT.format(context_block=context.as_prompt_block(), query=query)
+    response = model.invoke(prompt)
+    return response.content

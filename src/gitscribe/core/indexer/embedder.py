@@ -28,6 +28,10 @@ def _get_local_model(model_name: str):
 def _symbol_to_text(sym: Symbol) -> str:
     scope = f"{sym.parent}." if sym.parent else ""
     parts = [f"{sym.kind} {scope}{sym.name}", f"file: {sym.file}"]
+    if sym.docstring:
+        parts.append(f"docstring: {sym.docstring}")
+    if sym.snippet:
+        parts.append(f"code: {sym.snippet}")
     if sym.calls:
         parts.append("calls: " + ", ".join(sym.calls[:10]))
     if sym.bases:
@@ -44,8 +48,6 @@ def embed_symbols_local(symbols: list[Symbol], model_name: str = "all-MiniLM-L6-
 def embed_symbols_hosted(symbols: list[Symbol], cfg: dict) -> list[np.ndarray]:
     """Opt-in path. Same provider-agnostic pattern as llm_client.py — routes
     through the configured hosted embedding API, at the user's own cost.
-    Left as an explicit extension point; not wired to a specific provider
-    here since that's a BYOK config choice, not a code default.
     """
     raise NotImplementedError(
         "Hosted embeddings are opt-in. Configure embedding.provider in "

@@ -1,7 +1,8 @@
-import json
 import os
 import shutil
 import stat
+import sys
+import json
 import subprocess
 from enum import StrEnum
 from pathlib import Path
@@ -12,13 +13,13 @@ from dotenv import find_dotenv, load_dotenv
 from pydantic import ValidationError
 
 from gitscribe.core import memory
-from gitscribe.core.analysis import linter as linter_mod
-from gitscribe.core.analysis.rag import retrieve
 from gitscribe.core.config_schema import GitScribeConfig
 from gitscribe.core.graph import build_graph
+from gitscribe.core.analysis import linter as linter_mod
+from gitscribe.core.analysis.rag import answer_query, retrieve
 from gitscribe.core.indexer import index_store
+from gitscribe.core.llm_client import MissingAPIKeyError
 
-# usecwd=True: resolve relative to where the command is run, not cli.py's own
 load_dotenv(find_dotenv(usecwd=True))
 
 app = typer.Typer(help="GitScribe: stateful PR description generator (LangGraph-powered)")
@@ -242,14 +243,45 @@ def index(
 def query(
     text: str = typer.Argument(..., help="Natural language query"),
     top_k: int = typer.Option(5, help="Number of matches"),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Raw retrieval context as JSON, no LLM call"),
+    raw: bool = typer.Option(False, "--raw", help="Print raw retrieved context only, skip LLM synthesis"),
 ):
-    """Retrieval over the indexed codebase."""
+    """Ask a question about the indexed codebase.
+
+    By default this synthesizes an actual answer via the configured LLM,
+    grounded in retrieved symbols (cited as name/file:line) — it does not
+    just dump raw search hits.
+    """
     config = load_config()  # already a dict — see load_config() docstring
     context = retrieve(text, config, top_k=top_k)  # P0 FIX: was config.as_dict()
+
+    if not context.snippets:
+        typer.secho(
+            "No relevant symbols found for that query. Run `gitscribe index` first "
+            "if you haven't, or try rephrasing.",
+            err=True, fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=1)
+
     if json_output:
         typer.echo(context.model_dump_json())
-    else:
+        return
+
+    if raw:
+        typer.echo(context.as_prompt_block())
+        return
+
+    require_api_key()
+    try:
+        answer = answer_query(text, context, config)
+        typer.echo(answer)
+        typer.echo("\n--- context used ---")
+        typer.echo(context.as_prompt_block())
+    except MissingAPIKeyError as e:
+        typer.secho(str(e), err=True, fg=typer.colors.RED)
+        raise typer.Exit(code=1) from e
+    except Exception as e:
+        typer.secho(f"[gitscribe] answer synthesis failed ({e}); showing raw context instead:", err=True, fg=typer.colors.YELLOW)
         typer.echo(context.as_prompt_block())
 
 
@@ -273,35 +305,56 @@ def lint(
         raise typer.Exit(code=1)
 
 
+def _find_symbol(conn, symbol: str) -> tuple[int, str]:
+    """Resolves a user-typed name to a single (symbol_id, matched_name).
+    """
+    exact = conn.execute("SELECT id, name, file FROM symbols WHERE name = ?", (symbol,)).fetchall()
+    if len(exact) == 1:
+        return exact[0]["id"], exact[0]["name"]
+    if len(exact) > 1:
+        typer.echo(f"Ambiguous symbol '{symbol}' — found in multiple files:", err=True)
+        for r in exact:
+            typer.echo(f"  {r['file']}", err=True)
+        typer.echo("Re-run with a more specific name; disambiguation by file not yet supported.", err=True)
+        raise typer.Exit(code=1)
+
+    fuzzy = conn.execute(
+        "SELECT id, name, file FROM symbols WHERE name LIKE ? ORDER BY LENGTH(name) ASC LIMIT 10",
+        (f"%{symbol}%",),
+    ).fetchall()
+    if not fuzzy:
+        typer.echo(f"No symbol matching '{symbol}' found. Run `gitscribe index` first?", err=True)
+        raise typer.Exit(code=1)
+    if len(fuzzy) > 1:
+        typer.echo(f"No exact match for '{symbol}'. Closest matches:", err=True)
+        for r in fuzzy:
+            typer.echo(f"  {r['name']}  ({r['file']})", err=True)
+        typer.echo("Re-run with one of the names above.", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(f"(no exact match for '{symbol}' — using closest match '{fuzzy[0]['name']}')", err=True)
+    return fuzzy[0]["id"], fuzzy[0]["name"]
+
+
 @app.command()
 def graph(
-    symbol: str = typer.Argument(..., help="Symbol name to inspect"),
+    symbol: str = typer.Argument(..., help="Symbol name to inspect (exact or partial)"),
     depth: int = typer.Option(2, help="Traversal depth"),
     json_output: bool = typer.Option(False, "--json"),
 ):
     """Blast radius / dependency view for a named symbol."""
     conn = index_store._get_connection()
-    rows = conn.execute("SELECT id, name, file FROM symbols WHERE name = ?", (symbol,)).fetchall()
+    symbol_id, matched_name = _find_symbol(conn, symbol)
     conn.close()
-
-    if not rows:
-        typer.echo(f"No symbol named '{symbol}' found. Run `gitscribe index` first?", err=True)
-        raise typer.Exit(code=1)
-
-    if len(rows) > 1:
-        typer.echo(f"Ambiguous symbol '{symbol}' — found in multiple files:", err=True)
-        for r in rows:
-            typer.echo(f"  {r['file']}", err=True)
-        typer.echo("Re-run with the exact symbol; disambiguation by file not yet supported.", err=True)
-        raise typer.Exit(code=1)
-
-    symbol_id = rows[0]["id"]
     results = index_store.blast_radius(symbol_id, max_depth=depth)
 
     if json_output:
         typer.echo(json.dumps([r.model_dump() for r in results]))
     else:
-        typer.echo(f"Blast radius for '{symbol}' (depth {depth}):")
+        typer.echo(f"Blast radius for '{matched_name}' (depth {depth}):")
+        # P0 FIX: results now carry a real `direction` (caller/callee) —
+        # surfaced here instead of only showing an undifferentiated depth,
+        # since index_store.blast_radius() no longer conflates the two.
         for r in results:
             typer.echo(f"  [{r.direction:6} depth={r.depth}] {r.name} ({r.file}:{r.lineno})")
 
