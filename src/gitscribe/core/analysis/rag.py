@@ -1,11 +1,6 @@
 """
 core/analysis/rag.py
 Query -> embed -> vector search -> graph-expand -> assembled
-context. Replaces/augments today's branch-prefix PR retrieval with
-code-aware context. 
-Built as a public API from day one (not baked into
-generator.py), per the platform decision — Stage 4's `gitscribe query`
-CLI command and generator.py both call this module directly.
 """
 
 from __future__ import annotations
@@ -20,7 +15,7 @@ class ContextSnippet(BaseModel):
     name: str
     file: str
     lineno: int
-    relation: str  
+    relation: str
 
 
 class RAGContext(BaseModel):
@@ -60,8 +55,8 @@ def retrieve(query: str, cfg: dict, top_k: int = 5, expand_depth: int = 1) -> RA
                     symbol_id=related.symbol_id,
                     name=related.name,
                     file=related.file,
-                    lineno=0,  # blast_radius doesn't currently carry lineno; acceptable for context labeling
-                    relation="caller" if related.depth > 0 else "callee",
+                    lineno=related.lineno,
+                    relation=related.direction,
                 )
             )
 

@@ -3,7 +3,7 @@ Local sqlite memory layer -- one DB per user directory
 """
 
 import sqlite3
-from pathlib import Path 
+from pathlib import Path
 
 DB_PATH = Path.cwd() / "Storage" / "gitscribe.db"
 

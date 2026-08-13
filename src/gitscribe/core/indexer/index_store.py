@@ -12,15 +12,23 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel
 
-from gitscribe.core.indexer.embedder import blob_to_vector, cosine_similarity, embed_symbols, vector_to_blob
+from gitscribe.core.indexer.embedder import (
+    blob_to_vector,
+    cosine_similarity,
+    embed_symbols,
+    vector_to_blob,
+)
 from gitscribe.core.indexer.graph_builder import Edge, build_edges
 from gitscribe.core.indexer.parser import Symbol, parse_repo
 
 INDEX_DB_PATH = Path.cwd() / "Storage" / "gitscribe_index.db"
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+
+Direction = Literal["caller", "callee"]
 
 
 class SearchResult(BaseModel):
@@ -37,6 +45,8 @@ class BlastRadiusResult(BaseModel):
     name: str
     file: str
     depth: int  # hops from the queried symbol
+    direction: Direction = "callee"  # default kept for backward compatibility with existing callers/tests
+    lineno: int = 0  # 0 = unknown; real value populated below now that the query selects it
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -57,9 +67,6 @@ def init_schema() -> None:
 def rebuild_index(repo_root: str, cfg: dict) -> str | None:
     """Full rebuild per run (Stage 2 policy). Wipes and re-populates
     symbols/edges/embeddings — cascade deletes keep it consistent.
-    Returns a warning string if embeddings were skipped (e.g. missing
-    optional dependency); None on full success. Symbols/edges are usable
-    either way — only `search()` depends on embeddings existing.
     """
     symbols = parse_repo(repo_root)
 
@@ -96,13 +103,11 @@ def rebuild_index(repo_root: str, cfg: dict) -> str | None:
                 [(sid, vector_to_blob(vec), model_name) for (sid, _), vec in zip(embeddable, vectors)],
             )
             conn.commit()
-        except ImportError as e:
-            # Symbols/edges are already committed above — graph/blast_radius
-            # stay fully usable. Only `search()` (RAG query) needs embeddings,
-            # so this degrades gracefully rather than failing the whole index.
+        except Exception as e:
             embedding_error = (
-                f"Embeddings skipped: {e}. Install the embedding extra "
-                "(e.g. `pip install sentence-transformers`) to enable `gitscribe query`."
+                f"Embeddings skipped ({type(e).__name__}: {e}). Install/verify the embedding "
+                "extra (e.g. `pip install sentence-transformers`) and network access, then "
+                "re-run `gitscribe index` to enable `gitscribe query`."
             )
 
     conn.close()
@@ -150,35 +155,59 @@ def search(query: str, cfg: dict, top_k: int = 10) -> list[SearchResult]:
         for row, score in scored[:top_k]
     ]
 
+_CALLEE_CTE = """
+WITH RECURSIVE reach(id, depth) AS (
+    SELECT ?, 0
+    UNION
+    SELECT e.target_id, r.depth + 1
+    FROM edges e JOIN reach r ON e.source_id = r.id
+    WHERE e.resolved = 1 AND r.depth < ?
+)
+SELECT s.id AS id, s.name AS name, s.file AS file, s.lineno AS lineno, MIN(reach.depth) AS depth
+FROM reach JOIN symbols s ON s.id = reach.id
+WHERE reach.id != ?
+GROUP BY s.id
+ORDER BY depth
+"""
+
+_CALLER_CTE = """
+WITH RECURSIVE reach(id, depth) AS (
+    SELECT ?, 0
+    UNION
+    SELECT e.source_id, r.depth + 1
+    FROM edges e JOIN reach r ON e.target_id = r.id
+    WHERE e.resolved = 1 AND r.depth < ?
+)
+SELECT s.id AS id, s.name AS name, s.file AS file, s.lineno AS lineno, MIN(reach.depth) AS depth
+FROM reach JOIN symbols s ON s.id = reach.id
+WHERE reach.id != ?
+GROUP BY s.id
+ORDER BY depth
+"""
+
 
 def blast_radius(symbol_id: int, max_depth: int = 3) -> list[BlastRadiusResult]:
-    """Recursive CTE traversal — resolved edges only, both directions
-    (callers and callees), capped at max_depth hops.
+    """Impact-analysis traversal, split into two directional passes:
+
+      - "callee": symbols this symbol (transitively) calls
+      - "caller": symbols that (transitively) call this symbol
     """
     conn = _get_connection()
-    rows = conn.execute(
-        """
-        WITH RECURSIVE reach(id, depth) AS (
-            SELECT ?, 0
-            UNION
-            SELECT e.target_id, r.depth + 1
-            FROM edges e JOIN reach r ON e.source_id = r.id
-            WHERE e.resolved = 1 AND r.depth < ?
-            UNION
-            SELECT e.source_id, r.depth + 1
-            FROM edges e JOIN reach r ON e.target_id = r.id
-            WHERE e.resolved = 1 AND r.depth < ?
+    results: list[BlastRadiusResult] = []
+    for direction, cte in (("callee", _CALLEE_CTE), ("caller", _CALLER_CTE)):
+        rows = conn.execute(cte, (symbol_id, max_depth, symbol_id)).fetchall()
+        results.extend(
+            BlastRadiusResult(
+                symbol_id=row["id"],
+                name=row["name"],
+                file=row["file"],
+                depth=row["depth"],
+                direction=direction,
+                lineno=row["lineno"] if row["lineno"] is not None else 0,
+            )
+            for row in rows
         )
-        SELECT DISTINCT s.id, s.name, s.file, reach.depth
-        FROM reach JOIN symbols s ON s.id = reach.id
-        WHERE reach.id != ?
-        ORDER BY reach.depth
-        """,
-        (symbol_id, max_depth, max_depth, symbol_id),
-    ).fetchall()
     conn.close()
 
-    return [
-        BlastRadiusResult(symbol_id=row["id"], name=row["name"], file=row["file"], depth=row["depth"])
-        for row in rows
-    ]
+    results.sort(key=lambda r: (r.depth, r.direction, r.name))
+    return results

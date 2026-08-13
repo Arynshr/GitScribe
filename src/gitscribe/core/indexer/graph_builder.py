@@ -60,7 +60,7 @@ class SymbolResolver:
         if repo_wide and len(repo_wide) == 1:
             return repo_wide[0]
 
-        return None     
+        return None
 
 
 def build_edges(symbols_with_ids: list[tuple[int, Symbol]]) -> list[Edge]:
