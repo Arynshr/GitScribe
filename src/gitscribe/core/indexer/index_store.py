@@ -16,15 +16,14 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from gitscribe.core.indexer.embedder import (
-    blob_to_vector,
-    cosine_similarity,
-    embed_symbols,
-    vector_to_blob,
-)
+from gitscribe.core.indexer.embedder import blob_to_vector, cosine_similarity, embed_symbols, vector_to_blob
 from gitscribe.core.indexer.graph_builder import Edge, build_edges
 from gitscribe.core.indexer.parser import Symbol, parse_repo
 
+# Path.cwd()-relative by design (mirrors memory.py's convention): the CLI
+# is expected to be run from the repo root, same as `git` itself would be.
+# Kept as a module-level Path (not a string) so it round-trips through
+# sqlite3.connect() and pathlib operations identically on Windows/macOS/Linux.
 INDEX_DB_PATH = Path.cwd() / "Storage" / "gitscribe_index.db"
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
@@ -45,8 +44,8 @@ class BlastRadiusResult(BaseModel):
     name: str
     file: str
     depth: int  # hops from the queried symbol
-    direction: Direction = "callee"  # default kept for backward compatibility with existing callers/tests
-    lineno: int = 0  # 0 = unknown; real value populated below now that the query selects it
+    direction: Direction = "callee"
+    lineno: int = 0
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -67,6 +66,9 @@ def init_schema() -> None:
 def rebuild_index(repo_root: str, cfg: dict) -> str | None:
     """Full rebuild per run (Stage 2 policy). Wipes and re-populates
     symbols/edges/embeddings — cascade deletes keep it consistent.
+    Returns a warning string if embeddings were skipped (e.g. missing
+    optional dependency); None on full success. Symbols/edges are usable
+    either way — only `search()` depends on embeddings existing.
     """
     symbols = parse_repo(repo_root)
 
@@ -104,6 +106,9 @@ def rebuild_index(repo_root: str, cfg: dict) -> str | None:
             )
             conn.commit()
         except Exception as e:
+            # Symbols/edges are already committed above — graph/blast_radius
+            # stay usable even if embeddings fail (missing dep, no network,
+            # OOM, etc.). Only search() needs embeddings.
             embedding_error = (
                 f"Embeddings skipped ({type(e).__name__}: {e}). Install/verify the embedding "
                 "extra (e.g. `pip install sentence-transformers`) and network access, then "
@@ -155,6 +160,10 @@ def search(query: str, cfg: dict, top_k: int = 10) -> list[SearchResult]:
         for row, score in scored[:top_k]
     ]
 
+
+# Two independent, single-direction recursive CTEs (not one combined
+# bidirectional CTE) so direction is never ambiguous. GROUP BY s.id keeps
+# the shortest depth per symbol when multiple paths reach it.
 _CALLEE_CTE = """
 WITH RECURSIVE reach(id, depth) AS (
     SELECT ?, 0
@@ -188,9 +197,9 @@ ORDER BY depth
 
 def blast_radius(symbol_id: int, max_depth: int = 3) -> list[BlastRadiusResult]:
     """Impact-analysis traversal, split into two directional passes:
-
       - "callee": symbols this symbol (transitively) calls
       - "caller": symbols that (transitively) call this symbol
+    A symbol can appear once per direction if reachable both ways.
     """
     conn = _get_connection()
     results: list[BlastRadiusResult] = []

@@ -6,6 +6,10 @@ Default: local (sentence-transformers) — an indexer that silently costs
 API calls on every run is a bad default for a BYOK tool. Hosted embeddings
 are opt-in via config.yaml's `embedding:` block, mirroring llm_client.py's
 provider pattern.
+
+`_symbol_to_text()` embeds docstring + a short code snippet alongside the
+existing kind/name/file/calls/bases metadata, so semantic search has real
+natural-language/code content to match queries against, not just identifiers.
 """
 
 from __future__ import annotations
@@ -48,6 +52,8 @@ def embed_symbols_local(symbols: list[Symbol], model_name: str = "all-MiniLM-L6-
 def embed_symbols_hosted(symbols: list[Symbol], cfg: dict) -> list[np.ndarray]:
     """Opt-in path. Same provider-agnostic pattern as llm_client.py — routes
     through the configured hosted embedding API, at the user's own cost.
+    Left as an explicit extension point; not wired to a specific provider
+    here since that's a BYOK config choice, not a code default.
     """
     raise NotImplementedError(
         "Hosted embeddings are opt-in. Configure embedding.provider in "

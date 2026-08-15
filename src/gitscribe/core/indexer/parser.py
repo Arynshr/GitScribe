@@ -1,6 +1,13 @@
 """
 core/indexer/parser.py
 Stage 2, Step 1: AST-based symbol extraction. Python-only, stdlib `ast`.
+
+Each function/class/method symbol also captures a `docstring` (via
+`ast.get_docstring()`) and a `snippet` (first few body statements, for
+undocumented symbols) — this is what embedder.py embeds, so semantic
+search has real natural-language/code content to match against instead
+of just identifiers. Both fields are transient (in-memory only, not
+persisted to the DB — see index_store.py).
 """
 
 from __future__ import annotations
@@ -15,7 +22,7 @@ from gitscribe.core.diff_parser import filter_ignored_files, load_ignore_spec
 
 SymbolKind = Literal["function", "class", "method", "import"]
 
-# Caps keep embedding input bounded and predictable regardless of how long
+# Caps keep embedding input bounded, same spirit as embedder.py's calls[:10].
 _DOCSTRING_CHAR_CAP = 400
 _SNIPPET_STATEMENT_CAP = 3
 _SNIPPET_STATEMENT_CHAR_CAP = 100
@@ -27,11 +34,11 @@ class Symbol(BaseModel):
     file: str
     lineno: int
     end_lineno: int | None = None
-    parent: str | None = None
-    calls: list[str] = Field(default_factory=list)
-    bases: list[str] = Field(default_factory=list)
-    docstring: str | None = None
-    snippet: str | None = None
+    parent: str | None = None  # class name, if kind == "method"
+    calls: list[str] = Field(default_factory=list)  # raw call names, resolved later in graph_builder
+    bases: list[str] = Field(default_factory=list)  # raw base-class names, kind == "class" only
+    docstring: str | None = None  # cleaned via ast.get_docstring(); None if absent or kind == "import"
+    snippet: str | None = None  # first few body statements (unparsed), docstring itself excluded
 
 
 class SymbolVisitor(ast.NodeVisitor):
@@ -39,6 +46,9 @@ class SymbolVisitor(ast.NodeVisitor):
 
     Scope rule: methods are recorded with `parent` set to the enclosing
     class name so graph_builder can later scope call resolution correctly.
+    Nested functions (defined inside another function) are recorded but
+    not treated as top-level embeddable symbols — kept for completeness
+    only, per the "track but don't embed" decision.
     """
 
     def __init__(self, file_path: str):
@@ -154,10 +164,10 @@ class SymbolVisitor(ast.NodeVisitor):
     def _extract_docstring_and_snippet(
         node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
     ) -> tuple[str | None, str | None]:
-        """Returns (docstring, snippet).
-
-        `docstring` is the cleaned (dedented, stripped) docstring if one
-        exists, capped to keep embedding input bounded.
+        """Returns (docstring, snippet). `snippet` previews the first few
+        real body statements, excluding the docstring itself. Falls back
+        to None rather than raising, so one bad symbol can't abort a
+        whole repo parse.
         """
         docstring = ast.get_docstring(node, clean=True)
         if docstring:
