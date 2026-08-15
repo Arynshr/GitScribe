@@ -16,7 +16,12 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from gitscribe.core.indexer.embedder import blob_to_vector, cosine_similarity, embed_symbols, vector_to_blob
+from gitscribe.core.indexer.embedder import (
+    blob_to_vector,
+    cosine_similarity,
+    embed_symbols,
+    vector_to_blob,
+)
 from gitscribe.core.indexer.graph_builder import Edge, build_edges
 from gitscribe.core.indexer.parser import Symbol, parse_repo
 

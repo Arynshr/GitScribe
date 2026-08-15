@@ -1,8 +1,7 @@
+import json
 import os
 import shutil
 import stat
-import sys
-import json
 import subprocess
 from enum import StrEnum
 from pathlib import Path
@@ -13,10 +12,10 @@ from dotenv import find_dotenv, load_dotenv
 from pydantic import ValidationError
 
 from gitscribe.core import memory
-from gitscribe.core.config_schema import GitScribeConfig
-from gitscribe.core.graph import build_graph
 from gitscribe.core.analysis import linter as linter_mod
 from gitscribe.core.analysis.rag import answer_query, retrieve
+from gitscribe.core.config_schema import GitScribeConfig
+from gitscribe.core.graph import build_graph
 from gitscribe.core.indexer import index_store
 from gitscribe.core.llm_client import MissingAPIKeyError
 
