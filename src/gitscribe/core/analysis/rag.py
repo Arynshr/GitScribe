@@ -1,8 +1,9 @@
 """
 core/analysis/rag.py
-Query -> embed -> vector search -> graph-expand -> assembled
-context. Replaces/augments today's branch-prefix PR retrieval with
-code-aware context.
+Query -> embed -> vector search -> graph-expand -> assembled context.
+Replaces/augments today's branch-prefix PR retrieval with code-aware
+context. Public API from day one — Stage 4's `gitscribe query` CLI and
+generator.py both call this module directly.
 """
 
 from __future__ import annotations
@@ -57,8 +58,8 @@ def retrieve(query: str, cfg: dict, top_k: int = 5, expand_depth: int = 1) -> RA
                     symbol_id=related.symbol_id,
                     name=related.name,
                     file=related.file,
-                    lineno=related.lineno, 
-                    relation=related.direction, 
+                    lineno=related.lineno,
+                    relation=related.direction,
                 )
             )
 
@@ -75,9 +76,13 @@ _SYNTHESIS_PROMPT = (
 
 
 def answer_query(query: str, context: RAGContext, cfg: dict):
-    """Synthesizes a natural-language answer to `query`, grounded strictly in
-    the already-retrieved `context` — this is the step that was missing
-    before: `retrieve()` alone only returns raw matches, never an answer.
+    """Synthesizes a natural-language answer to `query`, grounded in the
+    already-retrieved `context`, via `llm_client.build_chat_model()`
+    (provider-agnostic, same BYOK pattern as the rest of the codebase).
+    Takes a pre-built `RAGContext` so callers can skip the LLM call when
+    there's nothing to ground an answer in. Raises whatever
+    `build_chat_model`/`model.invoke` raise — callers decide how to
+    surface or fall back.
     """
     from gitscribe.core.llm_client import build_chat_model
 

@@ -20,6 +20,7 @@ from gitscribe.core.analysis.rag import answer_query, retrieve
 from gitscribe.core.indexer import index_store
 from gitscribe.core.llm_client import MissingAPIKeyError
 
+# usecwd=True: resolve relative to where the command is run, not cli.py's own
 load_dotenv(find_dotenv(usecwd=True))
 
 app = typer.Typer(help="GitScribe: stateful PR description generator (LangGraph-powered)")
@@ -36,10 +37,9 @@ class Style(StrEnum):
 def load_config(path: str = "config.yaml") -> dict:
     """Load and validate config.yaml, returning a plain dict.
 
-    Fails fast with a clear message on bad config. Returns
-    `GitScribeConfig.as_dict()` directly — callers should use the
-    returned value as-is; it is already a dict, not a `GitScribeConfig`
-    instance, so it does NOT have an `.as_dict()` method of its own.
+    Fails fast with a clear message on bad config. Returns a plain dict
+    (already the result of `GitScribeConfig.as_dict()`) — callers should
+    use the return value as-is, not call `.as_dict()` on it again.
     """
     try:
         with open(path) as f:
@@ -104,9 +104,6 @@ def init():
         return
 
     shutil.copy(src, dest)
-    # os.name check keeps this a no-op (harmless) on platforms where chmod
-    # bits aren't meaningful (e.g. some Windows filesystems); on POSIX
-    # (Linux/macOS) it makes the hook executable as before.
     if os.name == "posix":
         dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
     typer.echo(f"[gitscribe] installed pre-push hook at {dest}")
@@ -248,9 +245,10 @@ def query(
 ):
     """Ask a question about the indexed codebase.
 
-    By default this synthesizes an actual answer via the configured LLM,
-    grounded in retrieved symbols (cited as name/file:line) — it does not
-    just dump raw search hits.
+    By default this synthesizes an answer via the configured LLM, grounded
+    in retrieved symbols (cited as name/file:line). Use --raw for the
+    context-block output only, or --json for structured retrieval data
+    with no LLM call (and no cost).
     """
     config = load_config()  # already a dict — see load_config() docstring
     context = retrieve(text, config, top_k=top_k)  # P0 FIX: was config.as_dict()
@@ -307,6 +305,8 @@ def lint(
 
 def _find_symbol(conn, symbol: str) -> tuple[int, str]:
     """Resolves a user-typed name to a single (symbol_id, matched_name).
+    Exact match wins if unambiguous; otherwise falls back to a substring
+    search. Exits via typer.Exit on no-match or ambiguous-match.
     """
     exact = conn.execute("SELECT id, name, file FROM symbols WHERE name = ?", (symbol,)).fetchall()
     if len(exact) == 1:
