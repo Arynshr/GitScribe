@@ -14,11 +14,13 @@ from pydantic import ValidationError
 
 from gitscribe.core import memory
 from gitscribe.core.config_schema import GitScribeConfig
+from gitscribe.core.diff_parser import GitCommandError
 from gitscribe.core.graph import build_graph
 from gitscribe.core.analysis import linter as linter_mod
 from gitscribe.core.analysis.rag import answer_query, retrieve
 from gitscribe.core.indexer import index_store
 from gitscribe.core.llm_client import MissingAPIKeyError
+from gitscribe.core.state import GitScribeState
 
 # usecwd=True: resolve relative to where the command is run, not cli.py's own
 load_dotenv(find_dotenv(usecwd=True))
@@ -68,6 +70,44 @@ def current_branch() -> str:
 def is_gh_authenticated() -> bool:
     result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
     return result.returncode == 0
+
+
+def default_branch() -> str | None:
+    """Best-effort repo default branch (e.g. 'main'). Returns None if it
+    can't be determined (no origin remote, detached HEAD info, etc.) —
+    callers treat that as "unknown", not an error.
+    """
+    result = subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip().rsplit("/", 1)[-1]
+
+
+def has_upstream_tracking_branch() -> bool:
+    result = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0
+
+
+def existing_pr_url(branch: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", branch, "--json", "url"],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return None  # gh missing — caller already checks shutil.which("gh") earlier in the flow
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)["url"]
+    except (json.JSONDecodeError, KeyError):
+        return None
 
 
 def require_api_key() -> None:
@@ -140,15 +180,19 @@ def generate(
     config = load_config()
     graph = build_graph(config)
 
-    initial_state = {
-        "branch_name": current_branch(),
-        "style": style.value,
-        "attempt_count": 0,
-        "fallback_used": False,
-        "status": "pending",
-    }
+    initial_state = GitScribeState(
+        branch_name=current_branch(),
+        style=style.value,
+        attempt_count=0,
+        fallback_used=False,
+        status="pending",
+    )
 
-    result = graph.invoke(initial_state)
+    try:
+        result = graph.invoke(initial_state)
+    except GitCommandError as e:
+        typer.secho(f"[gitscribe] {e}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(1) from e
 
     typer.echo(f"\nTitle: {result.get('pr_title')}\n")
     typer.echo(result.get("pr_body", "(no body generated)"))
@@ -169,8 +213,16 @@ def generate(
 @app.command(name="create-pr")
 def create_pr(
     style: Style = typer.Option(Style.default, "--style"),
+    push: bool = typer.Option(True, "--push/--no-push", help="Push the branch to origin first if it has no upstream tracking branch"),
 ):
-    """Generate a PR description and open the PR via `gh`."""
+    """Generate a PR description and open the PR via `gh`.
+
+    Handles the common `gh pr create` failure causes proactively instead
+    of just reporting them after the fact:
+      - branch not pushed to remote -> pushes it (unless --no-push)
+      - PR already exists for this branch -> prints its URL and exits, no error
+      - on the repo's default branch -> caught early with a clear message
+    """
     if not shutil.which("gh"):
         typer.secho(
             "[gitscribe] `gh` CLI not found. Install it: https://cli.github.com",
@@ -184,16 +236,50 @@ def create_pr(
         )
         raise typer.Exit(1)
 
+    branch = current_branch()
+    base = default_branch()
+    if base and branch == base:
+        typer.secho(
+            f"[gitscribe] you're on '{branch}', the repo's default branch — "
+            "checkout a feature branch first.",
+            err=True, fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+
+    existing_url = existing_pr_url(branch)
+    if existing_url:
+        typer.echo(f"[gitscribe] a PR already exists for '{branch}': {existing_url}")
+        return
+
+    if not has_upstream_tracking_branch():
+        if not push:
+            typer.secho(
+                f"[gitscribe] '{branch}' has no upstream on origin. "
+                f"Push it first (`git push -u origin {branch}`) or re-run without --no-push.",
+                err=True, fg=typer.colors.RED,
+            )
+            raise typer.Exit(1)
+        typer.echo(f"[gitscribe] '{branch}' has no upstream — pushing to origin...")
+        try:
+            subprocess.run(["git", "push", "-u", "origin", branch], check=True)
+        except subprocess.CalledProcessError as e:
+            typer.secho("[gitscribe] `git push` failed — see output above.", err=True, fg=typer.colors.RED)
+            raise typer.Exit(e.returncode or 1) from e
+
     require_api_key()
     config = load_config()
     graph = build_graph(config)
-    result = graph.invoke({
-        "branch_name": current_branch(),
-        "style": style.value,
-        "attempt_count": 0,
-        "fallback_used": False,
-        "status": "pending",
-    })
+    try:
+        result = graph.invoke(GitScribeState(
+            branch_name=branch,
+            style=style.value,
+            attempt_count=0,
+            fallback_used=False,
+            status="pending",
+        ))
+    except GitCommandError as e:
+        typer.secho(f"[gitscribe] {e}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(1) from e
 
     if result.get("status") != "success":
         typer.secho("[gitscribe] generation failed, not creating PR", err=True, fg=typer.colors.RED)
@@ -207,10 +293,8 @@ def create_pr(
         ], check=True)
     except subprocess.CalledProcessError as e:
         typer.secho(
-            "[gitscribe] `gh pr create` failed (see gh's output above for the reason — "
-            "common causes: branch not pushed to remote, a PR already exists for this "
-            "branch, or `gh` isn't authenticated for this repo). PR description was "
-            "generated but not opened.",
+            "[gitscribe] `gh pr create` failed (see gh's output above for the reason). "
+            "PR description was generated but not opened.",
             err=True, fg=typer.colors.RED,
         )
         raise typer.Exit(e.returncode or 1) from e
@@ -228,7 +312,7 @@ def index(
     """
     config = load_config()  # already a dict — see load_config() docstring
     index_store.init_schema()
-    warning = index_store.rebuild_index(repo_root, config)  # P0 FIX: was config.as_dict()
+    warning = index_store.rebuild_index(repo_root, config)  
 
     conn = index_store._get_connection()
     symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
@@ -260,8 +344,8 @@ def query(
     context-block output only, or --json for structured retrieval data
     with no LLM call (and no cost).
     """
-    config = load_config()  # already a dict — see load_config() docstring
-    context = retrieve(text, config, top_k=top_k)  # P0 FIX: was config.as_dict()
+    config = load_config()  
+    context = retrieve(text, config, top_k=top_k)  
 
     if not context.snippets:
         typer.secho(
@@ -362,9 +446,6 @@ def graph(
         typer.echo(json.dumps([r.model_dump() for r in results]))
     else:
         typer.echo(f"Blast radius for '{matched_name}' (depth {depth}):")
-        # P0 FIX: results now carry a real `direction` (caller/callee) —
-        # surfaced here instead of only showing an undifferentiated depth,
-        # since index_store.blast_radius() no longer conflates the two.
         for r in results:
             typer.echo(f"  [{r.direction:6} depth={r.depth}] {r.name} ({r.file}:{r.lineno})")
 
