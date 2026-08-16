@@ -1,7 +1,9 @@
 """
-Deterministic node: prompt construction + Groq call + structured parsing.
+Deterministic node: prompt construction + LLM call + structured parsing.
 This is the README's core 'chain' — no agent behavior, single call.
 """
+import re
+
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
@@ -41,8 +43,22 @@ Commit Messages:
 Past Style Examples (for tone/format only, do not copy content):
 {past_prs}
 
-{format_instructions}"""
+{format_instructions}
+
+Respond with ONLY the JSON object. No preamble, no explanation, no markdown \
+fence around it — just the raw JSON, starting with {{ and ending with }}."""
 )
+
+# Instruction-tuned models (esp. smaller ones like fallback 8B models) commonly
+# ignore "JSON only" instructions and add a sentence before/after it anyway.
+# Extracting the first balanced {...} block makes parsing robust to that instead
+# of depending entirely on the model following instructions perfectly.
+_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _extract_json_block(text: str) -> str:
+    match = _JSON_BLOCK_RE.search(text)
+    return match.group(0) if match else text
 
 
 def generator_node(state: GitScribeState, cfg: dict) -> dict:
@@ -60,27 +76,30 @@ def generator_node(state: GitScribeState, cfg: dict) -> dict:
         "format_instructions": PARSER.get_format_instructions(),
     })
 
-    with timed_llm_call("generator", model_name) as ctx:
-        ai_msg = llm.invoke(prompt_value)
-        ctx["usage"] = getattr(ai_msg, "usage_metadata", None)
-
+    # Parsing is inside the timed/logged block now, not after it — a call that
+    # returns text but fails to parse into PRDescription is a failed generation
     try:
-        result: PRDescription = PARSER.invoke(ai_msg)
-        body = (
-            f" Summary\n{result.summary}\n\n"
-            f" Changes\n{result.changes}\n\n"
-            f" Testing\n{result.testing}\n\n"
-            f" Impact\n{result.impact}"
-        )
-        return {
-            "pr_title": result.title,
-            "pr_body": body,
-            "status": "success",
-            "last_error": None,
-        }
+        with timed_llm_call("generator", model_name) as ctx:
+            ai_msg = llm.invoke(prompt_value)
+            ctx["usage"] = getattr(ai_msg, "usage_metadata", None)
+            cleaned = _extract_json_block(ai_msg.content)
+            result: PRDescription = PARSER.invoke(cleaned)
     except Exception as e:
         return {
             "last_error": str(e),
             "attempt_count": state.attempt_count + 1,
             "status": "failed",
         }
+
+    body = (
+        f" Summary\n{result.summary}\n\n"
+        f" Changes\n{result.changes}\n\n"
+        f" Testing\n{result.testing}\n\n"
+        f" Impact\n{result.impact}"
+    )
+    return {
+        "pr_title": result.title,
+        "pr_body": body,
+        "status": "success",
+        "last_error": None,
+    }

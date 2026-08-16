@@ -1,7 +1,8 @@
-import json
 import os
 import shutil
 import stat
+import sys
+import json
 import subprocess
 from enum import StrEnum
 from pathlib import Path
@@ -12,10 +13,10 @@ from dotenv import find_dotenv, load_dotenv
 from pydantic import ValidationError
 
 from gitscribe.core import memory
-from gitscribe.core.analysis import linter as linter_mod
-from gitscribe.core.analysis.rag import answer_query, retrieve
 from gitscribe.core.config_schema import GitScribeConfig
 from gitscribe.core.graph import build_graph
+from gitscribe.core.analysis import linter as linter_mod
+from gitscribe.core.analysis.rag import answer_query, retrieve
 from gitscribe.core.indexer import index_store
 from gitscribe.core.llm_client import MissingAPIKeyError
 
@@ -198,11 +199,21 @@ def create_pr(
         typer.secho("[gitscribe] generation failed, not creating PR", err=True, fg=typer.colors.RED)
         raise typer.Exit(1)
 
-    subprocess.run([
-        "gh", "pr", "create",
-        "--title", result["pr_title"],
-        "--body", result["pr_body"],
-    ], check=True)
+    try:
+        subprocess.run([
+            "gh", "pr", "create",
+            "--title", result["pr_title"],
+            "--body", result["pr_body"],
+        ], check=True)
+    except subprocess.CalledProcessError as e:
+        typer.secho(
+            "[gitscribe] `gh pr create` failed (see gh's output above for the reason — "
+            "common causes: branch not pushed to remote, a PR already exists for this "
+            "branch, or `gh` isn't authenticated for this repo). PR description was "
+            "generated but not opened.",
+            err=True, fg=typer.colors.RED,
+        )
+        raise typer.Exit(e.returncode or 1) from e
 
     memory.save_pr(result["branch_name"], result["pr_title"], result["pr_body"])
 
