@@ -225,3 +225,4 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 Storage/*.db
+.jsonl

@@ -1,8 +1,7 @@
+import json
 import os
 import shutil
 import stat
-import sys
-import json
 import subprocess
 from enum import StrEnum
 from pathlib import Path
@@ -13,11 +12,11 @@ from dotenv import find_dotenv, load_dotenv
 from pydantic import ValidationError
 
 from gitscribe.core import memory
+from gitscribe.core.analysis import linter as linter_mod
+from gitscribe.core.analysis.rag import answer_query, retrieve
 from gitscribe.core.config_schema import GitScribeConfig
 from gitscribe.core.diff_parser import GitCommandError
 from gitscribe.core.graph import build_graph
-from gitscribe.core.analysis import linter as linter_mod
-from gitscribe.core.analysis.rag import answer_query, retrieve
 from gitscribe.core.indexer import index_store
 from gitscribe.core.llm_client import MissingAPIKeyError
 from gitscribe.core.state import GitScribeState
@@ -312,7 +311,7 @@ def index(
     """
     config = load_config()  # already a dict — see load_config() docstring
     index_store.init_schema()
-    warning = index_store.rebuild_index(repo_root, config)  
+    warning = index_store.rebuild_index(repo_root, config)
 
     conn = index_store._get_connection()
     symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
@@ -344,8 +343,8 @@ def query(
     context-block output only, or --json for structured retrieval data
     with no LLM call (and no cost).
     """
-    config = load_config()  
-    context = retrieve(text, config, top_k=top_k)  
+    config = load_config()
+    context = retrieve(text, config, top_k=top_k)
 
     if not context.snippets:
         typer.secho(
