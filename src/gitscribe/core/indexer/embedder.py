@@ -6,6 +6,10 @@ Default: local (sentence-transformers) — an indexer that silently costs
 API calls on every run is a bad default for a BYOK tool. Hosted embeddings
 are opt-in via config.yaml's `embedding:` block, mirroring llm_client.py's
 provider pattern.
+
+`_symbol_to_text()` embeds docstring + a short code snippet alongside the
+existing kind/name/file/calls/bases metadata, so semantic search has real
+natural-language/code content to match queries against, not just identifiers.
 """
 
 from __future__ import annotations
@@ -28,6 +32,10 @@ def _get_local_model(model_name: str):
 def _symbol_to_text(sym: Symbol) -> str:
     scope = f"{sym.parent}." if sym.parent else ""
     parts = [f"{sym.kind} {scope}{sym.name}", f"file: {sym.file}"]
+    if sym.docstring:
+        parts.append(f"docstring: {sym.docstring}")
+    if sym.snippet:
+        parts.append(f"code: {sym.snippet}")
     if sym.calls:
         parts.append("calls: " + ", ".join(sym.calls[:10]))
     if sym.bases:

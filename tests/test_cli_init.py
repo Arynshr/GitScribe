@@ -1,5 +1,7 @@
 import os
+
 from typer.testing import CliRunner
+
 from gitscribe.cli import app
 
 runner = CliRunner()

@@ -40,8 +40,8 @@ class GitScribeConfig(BaseModel):
     def as_dict(self) -> dict:
         """Node functions currently index cfg["section"]["key"] - keep that working."""
         return self.model_dump()
-    
+
 class EmbeddingConfig(BaseModel):
-    provider: str = "local" 
+    provider: str = "local"
     model: str = "all-MiniLM-L6-v2"
-    
+

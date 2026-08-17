@@ -13,6 +13,13 @@ from gitscribe.core.state import GitScribeState
 DEFAULT_IGNORE_PATTERNS = ["*.lock", "package-lock.json", "*.min.js", "poetry.lock"]
 
 
+class GitCommandError(RuntimeError):
+    """Raised when a required git command fails — no origin/main, shallow
+    clone, detached HEAD with no upstream, fork PR, etc. Carries git's own
+    stderr so the caller sees the real reason instead of a raw traceback.
+    """
+
+
 def load_ignore_spec(repo_root: str = ".", extra_patterns: list[str] | None = None) -> pathspec.PathSpec:
     """Build a gitignore-aware matcher from .gitignore + config-supplied extras."""
     gitignore_path = Path(repo_root) / ".gitignore"
@@ -28,20 +35,22 @@ def load_ignore_spec(repo_root: str = ".", extra_patterns: list[str] | None = No
     return pathspec.PathSpec.from_lines("gitignore", lines)
 
 
-def get_raw_diff(base: str = "origin/main", head: str = "HEAD") -> str:
-    result = subprocess.run(
-        ["git", "diff", f"{base}...{head}"],
-        capture_output=True, text=True, check=True
-    )
+def _run_git(args: list[str]) -> str:
+    result = subprocess.run(["git", *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise GitCommandError(
+            f"`git {' '.join(args)}` failed: {result.stderr.strip() or 'no error output'}"
+        )
     return result.stdout
 
 
+def get_raw_diff(base: str = "origin/main", head: str = "HEAD") -> str:
+    return _run_git(["diff", f"{base}...{head}"])
+
+
 def get_commit_messages(base: str = "origin/main", head: str = "HEAD") -> list[str]:
-    result = subprocess.run(
-        ["git", "log", f"{base}..{head}", "--pretty=format:%s"],
-        capture_output=True, text=True, check=True
-    )
-    return [line for line in result.stdout.splitlines() if line.strip()]
+    output = _run_git(["log", f"{base}..{head}", "--pretty=format:%s"])
+    return [line for line in output.splitlines() if line.strip()]
 
 
 def filter_ignored_files(files: list[str], spec: pathspec.PathSpec) -> list[str]:
@@ -62,7 +71,8 @@ def extract_files_changed(diff_text: str) -> list[str]:
 
 
 def diff_parser_node(state: GitScribeState, cfg: dict) -> dict:
-    """LangGraph node: returns partial update with raw_diff, commit_messages, files_changed."""
+    """LangGraph node: returns partial update with raw_diff, commit_messages, files_changed.
+    """
     raw_diff = state.raw_diff or get_raw_diff()
     commit_messages = state.commit_messages or get_commit_messages()
 

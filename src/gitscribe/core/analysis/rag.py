@@ -1,11 +1,9 @@
 """
 core/analysis/rag.py
-Query -> embed -> vector search -> graph-expand -> assembled
-context. Replaces/augments today's branch-prefix PR retrieval with
-code-aware context. 
-Built as a public API from day one (not baked into
-generator.py), per the platform decision — Stage 4's `gitscribe query`
-CLI command and generator.py both call this module directly.
+Query -> embed -> vector search -> graph-expand -> assembled context.
+Replaces/augments today's branch-prefix PR retrieval with code-aware
+context. Public API from day one — Stage 4's `gitscribe query` CLI and
+generator.py both call this module directly.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ class ContextSnippet(BaseModel):
     name: str
     file: str
     lineno: int
-    relation: str  
+    relation: str
 
 
 class RAGContext(BaseModel):
@@ -60,9 +58,37 @@ def retrieve(query: str, cfg: dict, top_k: int = 5, expand_depth: int = 1) -> RA
                     symbol_id=related.symbol_id,
                     name=related.name,
                     file=related.file,
-                    lineno=0,  # blast_radius doesn't currently carry lineno; acceptable for context labeling
-                    relation="caller" if related.depth > 0 else "callee",
+                    lineno=related.lineno,
+                    relation=related.direction,
                 )
             )
 
     return RAGContext(query=query, snippets=snippets)
+
+
+_SYNTHESIS_PROMPT = (
+    "Answer the question using ONLY the code context below. Cite the specific "
+    "symbol name(s) and file:line for anything you state. If the context doesn't "
+    "contain enough information to answer, say so plainly instead of guessing.\n\n"
+    "{context_block}\n\n"
+    "Question: {query}"
+)
+
+
+def answer_query(query: str, context: RAGContext, cfg: dict):
+    """Synthesizes a natural-language answer to `query`, grounded in the
+    already-retrieved `context`, via `llm_client.build_chat_model()`
+    (provider-agnostic, same BYOK pattern as the rest of the codebase).
+    Takes a pre-built `RAGContext` so callers can skip the LLM call when
+    there's nothing to ground an answer in. Raises whatever
+    `build_chat_model`/`model.invoke` raise — callers decide how to
+    surface or fall back.
+    """
+    from gitscribe.core.llm_client import build_chat_model
+
+    model_name = cfg.get("llm", {}).get("model", "llama-3.3-70b-versatile")
+    model = build_chat_model(cfg, model_name=model_name, temperature=0.1)
+
+    prompt = _SYNTHESIS_PROMPT.format(context_block=context.as_prompt_block(), query=query)
+    response = model.invoke(prompt)
+    return response.content

@@ -1,7 +1,13 @@
 """
 core/indexer/parser.py
 Stage 2, Step 1: AST-based symbol extraction. Python-only, stdlib `ast`.
-Output to stdout only — no storage, no graph yet.
+
+Each function/class/method symbol also captures a `docstring` (via
+`ast.get_docstring()`) and a `snippet` (first few body statements, for
+undocumented symbols) — this is what embedder.py embeds, so semantic
+search has real natural-language/code content to match against instead
+of just identifiers. Both fields are transient (in-memory only, not
+persisted to the DB — see index_store.py).
 """
 
 from __future__ import annotations
@@ -16,6 +22,11 @@ from gitscribe.core.diff_parser import filter_ignored_files, load_ignore_spec
 
 SymbolKind = Literal["function", "class", "method", "import"]
 
+# Caps keep embedding input bounded, same spirit as embedder.py's calls[:10].
+_DOCSTRING_CHAR_CAP = 400
+_SNIPPET_STATEMENT_CAP = 3
+_SNIPPET_STATEMENT_CHAR_CAP = 100
+
 
 class Symbol(BaseModel):
     name: str
@@ -26,6 +37,8 @@ class Symbol(BaseModel):
     parent: str | None = None  # class name, if kind == "method"
     calls: list[str] = Field(default_factory=list)  # raw call names, resolved later in graph_builder
     bases: list[str] = Field(default_factory=list)  # raw base-class names, kind == "class" only
+    docstring: str | None = None  # cleaned via ast.get_docstring(); None if absent or kind == "import"
+    snippet: str | None = None  # first few body statements (unparsed), docstring itself excluded
 
 
 class SymbolVisitor(ast.NodeVisitor):
@@ -45,6 +58,7 @@ class SymbolVisitor(ast.NodeVisitor):
         self._func_stack: list[str] = []
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        docstring, snippet = self._extract_docstring_and_snippet(node)
         self.symbols.append(
             Symbol(
                 name=node.name,
@@ -54,6 +68,8 @@ class SymbolVisitor(ast.NodeVisitor):
                 end_lineno=getattr(node, "end_lineno", None),
                 parent=self._class_stack[-1] if self._class_stack else None,
                 bases=self._extract_bases(node),
+                docstring=docstring,
+                snippet=snippet,
             )
         )
         self._class_stack.append(node.name)
@@ -71,6 +87,7 @@ class SymbolVisitor(ast.NodeVisitor):
         in_class = bool(self._class_stack) and not is_nested
         kind = "method" if in_class else "function"
 
+        docstring, snippet = self._extract_docstring_and_snippet(node)
         sym = Symbol(
             name=node.name,
             kind=kind,
@@ -78,6 +95,8 @@ class SymbolVisitor(ast.NodeVisitor):
             lineno=node.lineno,
             end_lineno=getattr(node, "end_lineno", None),
             parent=self._class_stack[-1] if in_class else None,
+            docstring=docstring,
+            snippet=snippet,
         )
         sym.calls = self._extract_calls(node)
 
@@ -140,6 +159,40 @@ class SymbolVisitor(ast.NodeVisitor):
                 elif isinstance(func, ast.Attribute):
                     calls.append(func.attr)
         return calls
+
+    @staticmethod
+    def _extract_docstring_and_snippet(
+        node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[str | None, str | None]:
+        """Returns (docstring, snippet). `snippet` previews the first few
+        real body statements, excluding the docstring itself. Falls back
+        to None rather than raising, so one bad symbol can't abort a
+        whole repo parse.
+        """
+        docstring = ast.get_docstring(node, clean=True)
+        if docstring:
+            docstring = docstring.strip().replace("\n", " ")[:_DOCSTRING_CHAR_CAP]
+
+        body = node.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(getattr(body[0], "value", None), ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            body = body[1:]  # skip the docstring statement itself
+
+        snippet_parts: list[str] = []
+        for stmt in body[:_SNIPPET_STATEMENT_CAP]:
+            try:
+                unparsed = ast.unparse(stmt).strip().replace("\n", " ")
+            except Exception:
+                continue
+            if unparsed:
+                snippet_parts.append(unparsed[:_SNIPPET_STATEMENT_CHAR_CAP])
+
+        snippet = " | ".join(snippet_parts) if snippet_parts else None
+        return docstring, snippet
 
 
 def parse_file(path: str) -> list[Symbol]:

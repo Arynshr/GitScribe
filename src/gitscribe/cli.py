@@ -1,8 +1,7 @@
+import json
 import os
 import shutil
 import stat
-import sys
-import json
 import subprocess
 from enum import StrEnum
 from pathlib import Path
@@ -13,11 +12,14 @@ from dotenv import find_dotenv, load_dotenv
 from pydantic import ValidationError
 
 from gitscribe.core import memory
-from gitscribe.core.config_schema import GitScribeConfig
-from gitscribe.core.graph import build_graph
 from gitscribe.core.analysis import linter as linter_mod
-from gitscribe.core.analysis.rag import retrieve
+from gitscribe.core.analysis.rag import answer_query, retrieve
+from gitscribe.core.config_schema import GitScribeConfig
+from gitscribe.core.diff_parser import GitCommandError
+from gitscribe.core.graph import build_graph
 from gitscribe.core.indexer import index_store
+from gitscribe.core.llm_client import MissingAPIKeyError
+from gitscribe.core.state import GitScribeState
 
 # usecwd=True: resolve relative to where the command is run, not cli.py's own
 load_dotenv(find_dotenv(usecwd=True))
@@ -34,7 +36,12 @@ class Style(StrEnum):
 
 
 def load_config(path: str = "config.yaml") -> dict:
-    """Load and validate config.yaml. Fails fast with a clear message on bad config."""
+    """Load and validate config.yaml, returning a plain dict.
+
+    Fails fast with a clear message on bad config. Returns a plain dict
+    (already the result of `GitScribeConfig.as_dict()`) — callers should
+    use the return value as-is, not call `.as_dict()` on it again.
+    """
     try:
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
@@ -62,6 +69,44 @@ def current_branch() -> str:
 def is_gh_authenticated() -> bool:
     result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
     return result.returncode == 0
+
+
+def default_branch() -> str | None:
+    """Best-effort repo default branch (e.g. 'main'). Returns None if it
+    can't be determined (no origin remote, detached HEAD info, etc.) —
+    callers treat that as "unknown", not an error.
+    """
+    result = subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip().rsplit("/", 1)[-1]
+
+
+def has_upstream_tracking_branch() -> bool:
+    result = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0
+
+
+def existing_pr_url(branch: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", branch, "--json", "url"],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return None  # gh missing — caller already checks shutil.which("gh") earlier in the flow
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)["url"]
+    except (json.JSONDecodeError, KeyError):
+        return None
 
 
 def require_api_key() -> None:
@@ -98,7 +143,8 @@ def init():
         return
 
     shutil.copy(src, dest)
-    dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
+    if os.name == "posix":
+        dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
     typer.echo(f"[gitscribe] installed pre-push hook at {dest}")
 
     _ensure_api_key()
@@ -133,15 +179,19 @@ def generate(
     config = load_config()
     graph = build_graph(config)
 
-    initial_state = {
-        "branch_name": current_branch(),
-        "style": style.value,
-        "attempt_count": 0,
-        "fallback_used": False,
-        "status": "pending",
-    }
+    initial_state = GitScribeState(
+        branch_name=current_branch(),
+        style=style.value,
+        attempt_count=0,
+        fallback_used=False,
+        status="pending",
+    )
 
-    result = graph.invoke(initial_state)
+    try:
+        result = graph.invoke(initial_state)
+    except GitCommandError as e:
+        typer.secho(f"[gitscribe] {e}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(1) from e
 
     typer.echo(f"\nTitle: {result.get('pr_title')}\n")
     typer.echo(result.get("pr_body", "(no body generated)"))
@@ -162,8 +212,16 @@ def generate(
 @app.command(name="create-pr")
 def create_pr(
     style: Style = typer.Option(Style.default, "--style"),
+    push: bool = typer.Option(True, "--push/--no-push", help="Push the branch to origin first if it has no upstream tracking branch"),
 ):
-    """Generate a PR description and open the PR via `gh`."""
+    """Generate a PR description and open the PR via `gh`.
+
+    Handles the common `gh pr create` failure causes proactively instead
+    of just reporting them after the fact:
+      - branch not pushed to remote -> pushes it (unless --no-push)
+      - PR already exists for this branch -> prints its URL and exits, no error
+      - on the repo's default branch -> caught early with a clear message
+    """
     if not shutil.which("gh"):
         typer.secho(
             "[gitscribe] `gh` CLI not found. Install it: https://cli.github.com",
@@ -177,120 +235,218 @@ def create_pr(
         )
         raise typer.Exit(1)
 
+    branch = current_branch()
+    base = default_branch()
+    if base and branch == base:
+        typer.secho(
+            f"[gitscribe] you're on '{branch}', the repo's default branch — "
+            "checkout a feature branch first.",
+            err=True, fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+
+    existing_url = existing_pr_url(branch)
+    if existing_url:
+        typer.echo(f"[gitscribe] a PR already exists for '{branch}': {existing_url}")
+        return
+
+    if not has_upstream_tracking_branch():
+        if not push:
+            typer.secho(
+                f"[gitscribe] '{branch}' has no upstream on origin. "
+                f"Push it first (`git push -u origin {branch}`) or re-run without --no-push.",
+                err=True, fg=typer.colors.RED,
+            )
+            raise typer.Exit(1)
+        typer.echo(f"[gitscribe] '{branch}' has no upstream — pushing to origin...")
+        try:
+            subprocess.run(["git", "push", "-u", "origin", branch], check=True)
+        except subprocess.CalledProcessError as e:
+            typer.secho("[gitscribe] `git push` failed — see output above.", err=True, fg=typer.colors.RED)
+            raise typer.Exit(e.returncode or 1) from e
+
     require_api_key()
     config = load_config()
     graph = build_graph(config)
-    result = graph.invoke({
-        "branch_name": current_branch(),
-        "style": style.value,
-        "attempt_count": 0,
-        "fallback_used": False,
-        "status": "pending",
-    })
+    try:
+        result = graph.invoke(GitScribeState(
+            branch_name=branch,
+            style=style.value,
+            attempt_count=0,
+            fallback_used=False,
+            status="pending",
+        ))
+    except GitCommandError as e:
+        typer.secho(f"[gitscribe] {e}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(1) from e
 
     if result.get("status") != "success":
         typer.secho("[gitscribe] generation failed, not creating PR", err=True, fg=typer.colors.RED)
         raise typer.Exit(1)
 
-    subprocess.run([
-        "gh", "pr", "create",
-        "--title", result["pr_title"],
-        "--body", result["pr_body"],
-    ], check=True)
+    try:
+        subprocess.run([
+            "gh", "pr", "create",
+            "--title", result["pr_title"],
+            "--body", result["pr_body"],
+        ], check=True)
+    except subprocess.CalledProcessError as e:
+        typer.secho(
+            "[gitscribe] `gh pr create` failed (see gh's output above for the reason). "
+            "PR description was generated but not opened.",
+            err=True, fg=typer.colors.RED,
+        )
+        raise typer.Exit(e.returncode or 1) from e
 
     memory.save_pr(result["branch_name"], result["pr_title"], result["pr_body"])
 
+
 @app.command()
 def index(
-    repo_root: str = typer.Option(".", help = "Repo root to index"),
-    json_output: bool = typer.Option(False, "--json", help = "Machine-readable output"),
+    repo_root: str = typer.Option(".", help="Repo root to index"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output"),
 ):
     """Build/refresh the code graph + embeddings. Full rebuild per run
     (Stage 2 policy) — safe to re-run any time.
     """
-    config = load_config()
+    config = load_config()  # already a dict — see load_config() docstring
     index_store.init_schema()
-    warning = index_store.rebuild_index(repo_root, config.as_dict())
-    
+    warning = index_store.rebuild_index(repo_root, config)
+
     conn = index_store._get_connection()
     symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
     edge_count = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
     resolved_count = conn.execute("SELECT COUNT(*) FROM edges WHERE resolved = 1").fetchone()[0]
     conn.close()
-    
+
     stats = {"symbols": symbol_count, "edges": edge_count, "resolved_edges": resolved_count}
-    
+
     if json_output:
         typer.echo(json.dumps({**stats, "warning": warning}))
     else:
         typer.echo(f"Indexed {symbol_count} symbols, {edge_count} edges ({resolved_count} resolved).")
-        if warning: 
-                typer.echo(warning, err= True)
-                
+        if warning:
+            typer.echo(warning, err=True)
+
+
 @app.command()
 def query(
-    text: str = typer.Argument(..., help = "Natural language query"),
-    top_k: int = typer.Option(5, help = "Number of matches"),
-    json_output: bool = typer.Option(False, "--json"),
+    text: str = typer.Argument(..., help="Natural language query"),
+    top_k: int = typer.Option(5, help="Number of matches"),
+    json_output: bool = typer.Option(False, "--json", help="Raw retrieval context as JSON, no LLM call"),
+    raw: bool = typer.Option(False, "--raw", help="Print raw retrieved context only, skip LLM synthesis"),
 ):
-    """Retrieval over the indexed codebase."""
+    """Ask a question about the indexed codebase.
+
+    By default this synthesizes an answer via the configured LLM, grounded
+    in retrieved symbols (cited as name/file:line). Use --raw for the
+    context-block output only, or --json for structured retrieval data
+    with no LLM call (and no cost).
+    """
     config = load_config()
-    context = retrieve(text, config.as_dict(), top_k = top_k)
+    context = retrieve(text, config, top_k=top_k)
+
+    if not context.snippets:
+        typer.secho(
+            "No relevant symbols found for that query. Run `gitscribe index` first "
+            "if you haven't, or try rephrasing.",
+            err=True, fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=1)
+
     if json_output:
         typer.echo(context.model_dump_json())
-    else:
+        return
+
+    if raw:
         typer.echo(context.as_prompt_block())
-        
+        return
+
+    require_api_key()
+    try:
+        answer = answer_query(text, context, config)
+        typer.echo(answer)
+        typer.echo("\n--- context used ---")
+        typer.echo(context.as_prompt_block())
+    except MissingAPIKeyError as e:
+        typer.secho(str(e), err=True, fg=typer.colors.RED)
+        raise typer.Exit(code=1) from e
+    except Exception as e:
+        typer.secho(f"[gitscribe] answer synthesis failed ({e}); showing raw context instead:", err=True, fg=typer.colors.YELLOW)
+        typer.echo(context.as_prompt_block())
+
+
 @app.command()
 def lint(
-    repo_root: str = typer.Option(".", help = "Repo root to lint"),
+    repo_root: str = typer.Option(".", help="Repo root to lint"),
     json_output: bool = typer.Option(False, "--json"),
-    fails_on_error: bool = typer.Option(True, help = "Exit 1 if any error-serverity finding exists"),
+    fails_on_error: bool = typer.Option(True, help="Exit 1 if any error-severity finding exists"),
 ):
     findings = linter_mod.run_ruff(repo_root)
-    
+
     if json_output:
         typer.echo(json.dumps([f.model_dump() for f in findings]))
     else:
         for f in findings:
             typer.echo(f"{f.severity:8} {f.file}:{f.lineno}  {f.code}  {f.message}")
         typer.echo(f"\n{len(findings)} findings, severity score {linter_mod.severity_score(findings):.2f}")
-        
-    has_errors = any( f.severity == "error" for f in findings)
+
+    has_errors = any(f.severity == "error" for f in findings)
     if fails_on_error and has_errors:
         raise typer.Exit(code=1)
 
+
+def _find_symbol(conn, symbol: str) -> tuple[int, str]:
+    """Resolves a user-typed name to a single (symbol_id, matched_name).
+    Exact match wins if unambiguous; otherwise falls back to a substring
+    search. Exits via typer.Exit on no-match or ambiguous-match.
+    """
+    exact = conn.execute("SELECT id, name, file FROM symbols WHERE name = ?", (symbol,)).fetchall()
+    if len(exact) == 1:
+        return exact[0]["id"], exact[0]["name"]
+    if len(exact) > 1:
+        typer.echo(f"Ambiguous symbol '{symbol}' — found in multiple files:", err=True)
+        for r in exact:
+            typer.echo(f"  {r['file']}", err=True)
+        typer.echo("Re-run with a more specific name; disambiguation by file not yet supported.", err=True)
+        raise typer.Exit(code=1)
+
+    fuzzy = conn.execute(
+        "SELECT id, name, file FROM symbols WHERE name LIKE ? ORDER BY LENGTH(name) ASC LIMIT 10",
+        (f"%{symbol}%",),
+    ).fetchall()
+    if not fuzzy:
+        typer.echo(f"No symbol matching '{symbol}' found. Run `gitscribe index` first?", err=True)
+        raise typer.Exit(code=1)
+    if len(fuzzy) > 1:
+        typer.echo(f"No exact match for '{symbol}'. Closest matches:", err=True)
+        for r in fuzzy:
+            typer.echo(f"  {r['name']}  ({r['file']})", err=True)
+        typer.echo("Re-run with one of the names above.", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(f"(no exact match for '{symbol}' — using closest match '{fuzzy[0]['name']}')", err=True)
+    return fuzzy[0]["id"], fuzzy[0]["name"]
+
+
 @app.command()
 def graph(
-    symbol: str = typer.Argument(..., help="Symbol name to inspect"),
+    symbol: str = typer.Argument(..., help="Symbol name to inspect (exact or partial)"),
     depth: int = typer.Option(2, help="Traversal depth"),
     json_output: bool = typer.Option(False, "--json"),
 ):
     """Blast radius / dependency view for a named symbol."""
     conn = index_store._get_connection()
-    rows = conn.execute("SELECT id, name, file FROM symbols WHERE name = ?", (symbol,)).fetchall()
+    symbol_id, matched_name = _find_symbol(conn, symbol)
     conn.close()
- 
-    if not rows:
-        typer.echo(f"No symbol named '{symbol}' found. Run `gitscribe index` first?", err=True)
-        raise typer.Exit(code=1)
- 
-    if len(rows) > 1:
-        typer.echo(f"Ambiguous symbol '{symbol}' — found in multiple files:", err=True)
-        for r in rows:
-            typer.echo(f"  {r['file']}", err=True)
-        typer.echo("Re-run with the exact symbol; disambiguation by file not yet supported.", err=True)
-        raise typer.Exit(code=1)
- 
-    symbol_id = rows[0]["id"]
     results = index_store.blast_radius(symbol_id, max_depth=depth)
- 
+
     if json_output:
         typer.echo(json.dumps([r.model_dump() for r in results]))
     else:
-        typer.echo(f"Blast radius for '{symbol}' (depth {depth}):")
+        typer.echo(f"Blast radius for '{matched_name}' (depth {depth}):")
         for r in results:
-            typer.echo(f"  [{r.depth}] {r.name} ({r.file})")
+            typer.echo(f"  [{r.direction:6} depth={r.depth}] {r.name} ({r.file}:{r.lineno})")
 
 
 if __name__ == "__main__":
