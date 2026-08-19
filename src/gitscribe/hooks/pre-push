@@ -24,7 +24,7 @@ if [ "$has_valid_ref" = false ]; then
 fi
 
 echo "gitscribe: generating PR description..."
-gitscribe generate --remote "$remote" || {
+gitscribe generate || {
     echo "gitscribe: generation failed, continuing push anyway" >&2
     exit 0
 }
