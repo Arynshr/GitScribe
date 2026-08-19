@@ -20,7 +20,7 @@ STATE = GitScribeState(
 
 def test_risk_classifier_high_risk_does_not_skip():
     fake = FakeListChatModel(responses=[json.dumps({"risk_score": 0.9, "reasoning": "touches auth"})])
-    with patch("core.risk_classifier.ChatGroq", return_value=fake):
+    with patch("gitscribe.core.risk_classifier.build_chat_model", return_value=fake):
         result = risk_classifier_node(STATE, CFG)
 
     assert result["risk_score"] == 0.9
@@ -29,7 +29,7 @@ def test_risk_classifier_high_risk_does_not_skip():
 
 def test_risk_classifier_trivial_diff_skips():
     fake = FakeListChatModel(responses=[json.dumps({"risk_score": 0.05, "reasoning": "formatting only"})])
-    with patch("core.risk_classifier.ChatGroq", return_value=fake):
+    with patch("gitscribe.core.risk_classifier.build_chat_model", return_value=fake):
         result = risk_classifier_node(STATE, CFG)
 
     assert result["skip_generation"] is True
@@ -43,7 +43,7 @@ def test_risk_classifier_disabled_always_proceeds():
 
 def test_risk_classifier_fails_open_on_llm_error():
     fake = FakeListChatModel(responses=["not json"])
-    with patch("core.risk_classifier.ChatGroq", return_value=fake):
+    with patch("gitscribe.core.risk_classifier.build_chat_model", return_value=fake):
         result = risk_classifier_node(STATE, CFG)
 
     assert result["skip_generation"] is False
