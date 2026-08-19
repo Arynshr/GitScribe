@@ -28,12 +28,22 @@ def _severity_for(code: str) -> str:
     return "error" if code.startswith(_ERROR_PREFIXES) else "warning"
 
 
+class RuffNotFoundError(RuntimeError):
+    """Raised when the `ruff` binary isn't on PATH."""
+
+
 def run_ruff(repo_root: str = ".") -> list[LintFinding]:
-    result = subprocess.run(
-        ["ruff", "check", repo_root, "--output-format=json"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["ruff", "check", repo_root, "--output-format=json"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as e:
+        raise RuffNotFoundError(
+            "`ruff` not found on PATH. It's a project dependency - "
+            "install it with `pip install ruff` or reinstall gitscribe."
+        ) from e
     if not result.stdout.strip():
         return []
 
