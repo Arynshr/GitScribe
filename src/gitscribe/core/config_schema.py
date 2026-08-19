@@ -30,18 +30,20 @@ class FailureHandlingConfig(BaseModel):
     retry_backoff_seconds: float = Field(ge=0, default=2)
 
 
+class EmbeddingConfig(BaseModel):
+    provider: str = "local"
+    model: str = "all-MiniLM-L6-v2"
+
+
 class GitScribeConfig(BaseModel):
     llm: LLMConfig
     retrieval: RetrievalConfig = RetrievalConfig()
     risk_classifier: RiskClassifierConfig = RiskClassifierConfig()
     failure_handling: FailureHandlingConfig = FailureHandlingConfig()
+    embedding: EmbeddingConfig = EmbeddingConfig()
     ignore_patterns: list[str] = Field(default_factory=list)
 
     def as_dict(self) -> dict:
         """Node functions currently index cfg["section"]["key"] - keep that working."""
         return self.model_dump()
-
-class EmbeddingConfig(BaseModel):
-    provider: str = "local"
-    model: str = "all-MiniLM-L6-v2"
 
