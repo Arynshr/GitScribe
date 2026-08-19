@@ -1,7 +1,7 @@
 llm:
   provider: groq
-  model: llama-3.3-70b-versatile
-  fallback_model: llama-3.1-8b-instant
+  model: openai/gpt-oss-20b
+  fallback_model: openai/gpt-oss-20b
   temperature: 0.2
   max_tokens: 1000
 
@@ -19,8 +19,6 @@ failure_handling:
   max_retries: 2
   retry_backoff_seconds: 2
 
-# Extra patterns merged on top of the repo's .gitignore (not a replacement for it).
-# Useful for things you don't want git to ignore but also don't want in PR diffs.
 ignore_patterns:
   - "*.lock"
   - "poetry.lock"
