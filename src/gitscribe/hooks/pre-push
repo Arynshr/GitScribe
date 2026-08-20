@@ -1,32 +1,10 @@
 #!/usr/bin/env bash
-# src/gitscribe/hooks/pre-push
-# Installed into .git/hooks/pre-push by `gitscribe init`.
-
 set -uo pipefail
-
-if ! command -v gitscribe >/dev/null 2>&1; then
-    exit 0
-fi
-
-remote="$1"
-url="$2"
-
-# Skip on deletes (no local ref) — nothing to describe.
+command -v gitscribe >/dev/null 2>&1 || exit 0
 has_valid_ref=false
 while read -r local_ref local_sha remote_ref remote_sha; do
-    if [ "$local_sha" != "0000000000000000000000000000000000000000" ]; then
-        has_valid_ref=true
-    fi
+    [ "$local_sha" != "0000000000000000000000000000000000000000" ] && has_valid_ref=true
 done
-
-if [ "$has_valid_ref" = false ]; then
-    exit 0
-fi
-
-echo "gitscribe: generating PR description..."
-gitscribe generate || {
-    echo "gitscribe: generation failed, continuing push anyway" >&2
-    exit 0
-}
-
-exit 0
+[ "$has_valid_ref" = false ] && exit 0
+gitscribe pre-push
+exit $?
