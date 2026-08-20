@@ -19,6 +19,17 @@ failure_handling:
   max_retries: 2
   retry_backoff_seconds: 2
 
+hooks:
+  pre_push:
+    block_on_risk: false
+  merge_check:
+    block_on_risk: false
+  post_merge:
+    auto_tag: false
+    push_tag: false
+  commit_msg:
+    enabled: true
+
 ignore_patterns:
   - "*.lock"
   - "poetry.lock"
