@@ -2,7 +2,6 @@ import hashlib
 import json
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 from gitscribe.core.diff_parser import get_raw_diff

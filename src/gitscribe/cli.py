@@ -14,14 +14,16 @@ from pydantic import ValidationError
 
 from gitscribe import console
 from gitscribe.core import memory
+from gitscribe.core import hooks as hook_utils
 from gitscribe.core.analysis import linter as linter_mod
 from gitscribe.core.analysis.rag import answer_query, retrieve
 from gitscribe.core.config_schema import GitScribeConfig
-from gitscribe.core.diff_parser import GitCommandError, _run_git
+from gitscribe.core.diff_parser import GitCommandError, _run_git, diff_parser_node, get_raw_diff, get_commit_messages
 from gitscribe.core.graph import build_graph
 from gitscribe.core.indexer import index_store
 from gitscribe.core.llm_client import MissingAPIKeyError
 from gitscribe.core.state import GitScribeState
+from gitscribe.core.summarizer import summarizer_node
 
 # usecwd=True: resolve relative to where the command is run, not cli.py's own
 load_dotenv(find_dotenv(usecwd=True))
@@ -29,6 +31,7 @@ load_dotenv(find_dotenv(usecwd=True))
 app = typer.Typer(help="GitScribe: stateful PR description generator (LangGraph-powered)")
 
 ENV_PATH = Path(".env")
+repo_hooks_dir = Path(".git") / "hooks"
 
 
 class Style(StrEnum):
@@ -118,14 +121,14 @@ def require_api_key() -> None:
         console.error("API_KEY not set. Run `gitscribe init` or `export API_KEY=<your-key>`.")
         raise typer.Exit(1)
 
-
 @app.command()
 def init():
     """Install the pre-push git hook into .git/hooks/."""
-    repo_hooks_dir = Path(".git") / "hooks"
-    if not repo_hooks_dir.exists():
-        console.error(".git/hooks not found - run this from a git repo root")
-        raise typer.Exit(1)
+    for hook_name in ["pre-push", "pre-merge-commit", "post-merge", "commit-msg"]:
+        src = Path(__file__).parent / "hooks" / hook_name
+        dest = repo_hooks_dir / hook_name
+        dest.write_text(src.read_text())
+        dest.chmod(0o755)
 
     src = Path(__file__).parent / "hooks" / "pre-push"
     dest = repo_hooks_dir / "pre-push"
@@ -488,6 +491,98 @@ def graph(
         for r in group:
             indent = "  " * r.depth
             console.info(f"{indent}└─ {r.name}  ({r.file}:{r.lineno})  [depth {r.depth}]")
+            
+@app.command(name="pre-push")
+def pre_push_cmd():
+    cfg = load_config()
+    hard_block = cfg.get("hooks", {}).get("pre_push", {}).get("block_on_risk", False)
+    result = hook_utils.get_cached_risk(cfg, base="origin/main", head="HEAD")
+    threshold = cfg["risk_classifier"]["trivial_threshold"] * 3
+
+    if result["risk_score"] >= threshold:
+        print(f"⚠ high-risk diff ({result['risk_score']:.2f}): {result['risk_reasoning']}")
+        if hard_block:
+            print("blocked — override with: git push --no-verify")
+            raise typer.Exit(code=1)
+
+    has_upstream = subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", "@{u}"], capture_output=True
+    ).returncode != 0
+    if has_upstream:
+        subprocess.run(["gitscribe", "create-pr"])
+
+
+@app.command(name="merge-check")
+def merge_check_cmd():
+    cfg = load_config()
+    hard_block = cfg.get("hooks", {}).get("merge_check", {}).get("block_on_risk", False)
+    result = hook_utils.get_cached_risk(cfg, base="HEAD", head="MERGE_HEAD")
+    threshold = cfg["risk_classifier"]["trivial_threshold"] * 4
+
+    if result["risk_score"] >= threshold:
+        print(f"⚠ merge risk ({result['risk_score']:.2f}): {result['risk_reasoning']}")
+        if hard_block:
+            print("blocked — override with: git merge --no-verify")
+            raise typer.Exit(code=1)
+    print(f"✓ merge-check passed (risk {result['risk_score']:.2f})")
+
+
+@app.command(name="post-merge")
+def post_merge_cmd(ff: str = typer.Option("0")):
+    cfg = load_config()
+    branch = current_branch()
+
+    if not Path(".git/MERGE_MSG").exists() and ff == "1":
+        return  # fast-forward, nothing merged to record
+
+    diff = get_raw_diff(base="HEAD@{1}", head="HEAD")
+    commits = get_commit_messages(base="HEAD@{1}", head="HEAD")
+    state = GitScribeState(branch_name=branch, raw_diff=diff, commit_messages=commits)
+
+    files = diff_parser_node(state, cfg)
+    state.files_changed = files["files_changed"]
+    summary = summarizer_node(state)
+    memory.save_pr(branch, title=f"Merged: {branch}", body="\n".join(summary["change_summary"]))
+
+    if cfg.get("hooks", {}).get("post_merge", {}).get("auto_tag", False):
+        bump = hook_utils.BUMP_FILE.read_text().strip() if hook_utils.BUMP_FILE.exists() else "patch"
+        tag = hook_utils.next_tag(bump)
+        subprocess.run(["git", "tag", tag])
+        print(f"gitscribe: tagged {tag} ({bump})")
+        if cfg["hooks"]["post_merge"].get("push_tag", False):
+            subprocess.run(["git", "push", "origin", tag])
+
+
+@app.command(name="commit-msg")
+def commit_msg_cmd(msg_file: str = typer.Argument(...)):
+    cfg = load_config()
+    if not cfg.get("hooks", {}).get("commit_msg", {}).get("enabled", True):
+        return
+
+    raw = Path(msg_file).read_text()
+    subject = raw.splitlines()[0] if raw.splitlines() else ""
+    if subject.startswith(("Merge ", "Revert ")):
+        return
+
+    if not hook_utils.COMMIT_RE.match(subject):
+        print(f"✗ not a Conventional Commit:\n  {subject}", file=sys.stderr)
+        print("  format: <type>(<scope>)!: <description>", file=sys.stderr)
+        print("  types: feat fix build chore ci docs style refactor perf test", file=sys.stderr)
+        raise typer.Exit(code=1)
+
+    bump = hook_utils.bump_for_commit(subject, raw)
+    hook_utils.BUMP_FILE.write_text(bump)
+
+
+@app.command(name="merge-conflict")
+def merge_conflict_cmd():
+    files = hook_utils.conflicted_files()
+    if not files:
+        print("No conflicts detected.")
+        return
+    print(f"gitscribe: {len(files)} file(s) with conflicts:")
+    for f in files:
+        print(f"  - {f}")
 
 
 if __name__ == "__main__":
