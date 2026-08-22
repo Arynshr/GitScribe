@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gitscribe"
-version = "0.1"
-description = "Stateful PR description generator"
+version = "0.2"
+description = "LangGraph-powered command-line tool and codebase indexer"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

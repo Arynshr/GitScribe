@@ -99,19 +99,17 @@ def has_upstream_tracking_branch() -> bool:
 
 
 def existing_pr_url(branch: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "view", branch, "--json", "url"],
-            capture_output=True, text=True,
-        )
-    except FileNotFoundError:
-        return None  # gh missing — caller already checks shutil.which("gh") earlier in the flow
+    result = subprocess.run(
+        ["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url"],
+        capture_output=True, text=True,
+    )
     if result.returncode != 0:
         return None
     try:
-        return json.loads(result.stdout)["url"]
-    except (json.JSONDecodeError, KeyError):
+        prs = json.loads(result.stdout)
+    except json.JSONDecodeError:
         return None
+    return prs[0]["url"] if prs else None
 
 
 def require_api_key() -> None:
