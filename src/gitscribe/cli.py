@@ -13,12 +13,17 @@ from dotenv import find_dotenv, load_dotenv
 from pydantic import ValidationError
 
 from gitscribe import console
-from gitscribe.core import memory
-from gitscribe.core import hooks as hook_utils
+from gitscribe.core import hooks as hook_utils, memory
 from gitscribe.core.analysis import linter as linter_mod
 from gitscribe.core.analysis.rag import answer_query, retrieve
 from gitscribe.core.config_schema import GitScribeConfig
-from gitscribe.core.diff_parser import GitCommandError, _run_git, diff_parser_node, get_raw_diff, get_commit_messages
+from gitscribe.core.diff_parser import (
+    GitCommandError,
+    _run_git,
+    diff_parser_node,
+    get_commit_messages,
+    get_raw_diff,
+)
 from gitscribe.core.graph import build_graph
 from gitscribe.core.indexer import index_store
 from gitscribe.core.llm_client import MissingAPIKeyError
@@ -491,7 +496,7 @@ def graph(
         for r in group:
             indent = "  " * r.depth
             console.info(f"{indent}└─ {r.name}  ({r.file}:{r.lineno})  [depth {r.depth}]")
-            
+
 @app.command(name="pre-push")
 def pre_push_cmd():
     cfg = load_config()

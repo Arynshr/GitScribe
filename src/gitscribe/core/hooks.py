@@ -5,9 +5,9 @@ import subprocess
 from pathlib import Path
 
 from gitscribe.core.diff_parser import extract_files_changed, get_commit_messages, get_raw_diff
-from gitscribe.core.summarizer import summarize_diff
 from gitscribe.core.risk_classifier import risk_classifier_node
 from gitscribe.core.state import GitScribeState
+from gitscribe.core.summarizer import summarize_diff
 
 CACHE_DIR = Path(".git") / "gitscribe-cache"
 BUMP_FILE = Path(".git") / "gitscribe-last-bump"
