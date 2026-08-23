@@ -4,7 +4,8 @@ import re
 import subprocess
 from pathlib import Path
 
-from gitscribe.core.diff_parser import get_raw_diff
+from gitscribe.core.diff_parser import extract_files_changed, get_commit_messages, get_raw_diff
+from gitscribe.core.summarizer import summarize_diff
 from gitscribe.core.risk_classifier import risk_classifier_node
 from gitscribe.core.state import GitScribeState
 
@@ -20,25 +21,28 @@ COMMIT_RE = re.compile(
 BREAKING_FOOTER_RE = re.compile(r"^BREAKING CHANGE: .+", re.MULTILINE)
 
 
-def _diff_cache_key(base: str, head: str) -> str:
+def _diff_cache_key(base: str, head: str) -> tuple[str, str]:
     raw = get_raw_diff(base=base, head=head)
     return hashlib.sha1(raw.encode()).hexdigest(), raw
 
 
 def get_cached_risk(cfg: dict, base: str, head: str) -> dict:
-    """Single source of truth for risk score. pre-push and merge-check both call this —
-    same diff => cache hit, no duplicate LLM call."""
     key, raw = _diff_cache_key(base, head)
     CACHE_DIR.mkdir(exist_ok=True)
     cache_file = CACHE_DIR / f"{key}.json"
     if cache_file.exists():
         return json.loads(cache_file.read_text())
 
-    state = GitScribeState(raw_diff=raw)
+    files_changed = extract_files_changed(raw)
+    state = GitScribeState(
+        raw_diff=raw,
+        files_changed=files_changed,
+        change_summary=summarize_diff(files_changed, raw),
+        commit_messages=get_commit_messages(base=base, head=head),
+    )
     result = risk_classifier_node(state, cfg)
     cache_file.write_text(json.dumps(result))
     return result
-
 
 def bump_for_commit(subject: str, body: str) -> str:
     m = COMMIT_RE.match(subject)

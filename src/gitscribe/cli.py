@@ -121,27 +121,29 @@ def require_api_key() -> None:
 
 @app.command()
 def init():
-    """Install the pre-push git hook into .git/hooks/."""
-    for hook_name in ["pre-push", "pre-merge-commit", "post-merge", "commit-msg"]:
-        src = Path(__file__).parent / "hooks" / hook_name
-        dest = repo_hooks_dir / hook_name
-        dest.write_text(src.read_text())
-        dest.chmod(0o755)
+    """Install the pre-push, pre-merge-commit, post-merge, and commit-msg git hooks into .git/hooks/."""
+    if not repo_hooks_dir.exists():
+        console.error(".git/hooks not found - run this from a git repo root")
+        raise typer.Exit(1)
 
-    src = Path(__file__).parent / "hooks" / "pre-push"
     dest = repo_hooks_dir / "pre-push"
-
     if dest.exists():
         console.warn(f"{dest} already exists - not overwriting. Remove it first if you want to reinstall.")
         return
 
-    shutil.copy(src, dest)
-    if os.name == "posix":
-        dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
-    console.success(f"installed pre-push hook at {dest}")
+    hook_names = ["pre-push", "pre-merge-commit", "post-merge", "commit-msg"]
+    for hook_name in hook_names:
+        src = Path(__file__).parent / "hooks" / f"{hook_name}.sh"
+        dest = repo_hooks_dir / hook_name  # git requires the extensionless name here
+        if not src.exists():
+            console.error(f"hook source missing: {src}")
+            raise typer.Exit(1)
+        dest.write_text(src.read_text())
+        if os.name == "posix":
+            dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
 
+    console.success(f"installed {len(hook_names)} git hooks into {repo_hooks_dir}")
     _ensure_api_key()
-
 
 def _ensure_api_key() -> None:
     """Write API_KEY to .env if not already available"""
