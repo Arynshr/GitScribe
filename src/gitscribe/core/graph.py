@@ -29,14 +29,28 @@ from gitscribe.core.summarizer import summarizer_node
 
 
 def template_fallback_node(state: GitScribeState) -> dict:
-    """No-LLM fallback: deterministic template from change_summary alone."""
+    """No-LLM fallback: deterministic template from change_summary alone.
+
+    Reached via two very different paths that must NOT be conflated:
+      - risk_classifier decided the diff is trivial (skip_generation=True) -
+        intentional, not a problem.
+      - failure_router exhausted retries after real LLM failures - status
+        was already "failed" on state, but this node used to stomp it back
+        to "success" unconditionally. That silently told callers (cli.py's
+        `generate`/`create-pr`) that generation succeeded even when the LLM
+        never produced usable output - create-pr would have opened a real
+        GitHub PR with this generic body with zero indication anything had
+        gone wrong. Preserving the real status lets callers tell the two
+        cases apart and surface state.last_error/failure_type when relevant.
+    """
     files = ", ".join(state.files_changed) or "no files detected"
     body = (
         f"## Summary\nAutomated fallback description.\n\n"
         f"## Changes\n{chr(10).join('- ' + s for s in state.change_summary)}\n\n"
         f"## Files\n{files}"
     )
-    return {"pr_title": "PR: " + files[:60], "pr_body": body, "status": "success"}
+    status = "skipped" if state.skip_generation else "failed"
+    return {"pr_title": "PR: " + files[:60], "pr_body": body, "status": status}
 
 
 def retry_same_model_node(state: GitScribeState, cfg: dict) -> dict:

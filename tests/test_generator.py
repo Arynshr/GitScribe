@@ -28,7 +28,7 @@ STATE = GitScribeState(
 
 def test_generator_node_success():
     fake_llm = FakeListChatModel(responses=[FAKE_PR_JSON])
-    with patch("core.generator.ChatGroq", return_value=fake_llm):
+    with patch("gitscribe.core.generator.build_chat_model", return_value=fake_llm):
         result = generator_node(STATE, CFG)
 
     assert result["status"] == "success"
@@ -39,7 +39,7 @@ def test_generator_node_success():
 
 def test_generator_node_bad_output_marks_failed():
     fake_llm = FakeListChatModel(responses=["not valid json at all"])
-    with patch("core.generator.ChatGroq", return_value=fake_llm):
+    with patch("gitscribe.core.generator.build_chat_model", return_value=fake_llm):
         result = generator_node(STATE, CFG)
 
     assert result["status"] == "failed"
@@ -64,7 +64,7 @@ def test_style_instruction_reaches_prompt_text():
 def test_generator_node_passes_state_style_through_without_error():
     fake_llm = FakeListChatModel(responses=[FAKE_PR_JSON])
     concise_state = STATE.model_copy(update={"style": "concise"})
-    with patch("core.generwator.ChatGroq", return_value=fake_llm):
+    with patch("gitscribe.core.generator.build_chat_model", return_value=fake_llm):
         result = generator_node(concise_state, CFG)
 
     assert result["status"] == "success"

@@ -37,7 +37,11 @@ def retriever_node(state: GitScribeState, cfg: dict) -> dict:
     depth_used = min_n
     stopped_reason = "min_prs_default"
 
-    if cfg["risk_classifier"]["enabled"]:
+    # Adaptive widening only makes sense if there's actually room to widen.
+    # (Previously gated on cfg["risk_classifier"]["enabled"] - an unrelated
+    # feature's flag; disabling risk classification silently also disabled
+    # retrieval's own LLM-driven widening, which was never the intent.)
+    if max_n > min_n:
         llm = build_chat_model(cfg, cfg["llm"]["model"], temperature=0)
         chain = RELEVANCE_PROMPT | llm | JsonOutputParser()
 

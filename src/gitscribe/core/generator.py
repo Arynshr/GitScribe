@@ -92,10 +92,10 @@ def generator_node(state: GitScribeState, cfg: dict) -> dict:
         }
 
     body = (
-        f" Summary\n{result.summary}\n\n"
-        f" Changes\n{result.changes}\n\n"
-        f" Testing\n{result.testing}\n\n"
-        f" Impact\n{result.impact}"
+        f"## Summary\n{result.summary}\n\n"
+        f"## Changes\n{result.changes}\n\n"
+        f"## Testing\n{result.testing}\n\n"
+        f"## Impact\n{result.impact}"
     )
     return {
         "pr_title": result.title,

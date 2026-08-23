@@ -19,6 +19,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from gitscribe.core.diff_parser import filter_ignored_files, load_ignore_spec
+from gitscribe.core.telemetry import logger
 
 SymbolKind = Literal["function", "class", "method", "import"]
 
@@ -218,7 +219,10 @@ def parse_repo(repo_root: str = ".") -> list[Symbol]:
         try:
             symbols.extend(parse_file(file_path))
         except SyntaxError as e:
-            print(f"[skip] {file_path}: {e}")
+            # stderr via the logger, never stdout - parse_repo() feeds
+            # `gitscribe index`, whose --json output must be clean JSON
+            # on stdout with nothing else interleaved into it.
+            logger.warning("skipping %s: %s", file_path, e)
     return symbols
 
 

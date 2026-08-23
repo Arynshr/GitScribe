@@ -6,20 +6,29 @@ import subprocess
 from enum import StrEnum
 from pathlib import Path
 
+import click
 import typer
 import yaml
 from dotenv import find_dotenv, load_dotenv
 from pydantic import ValidationError
 
-from gitscribe.core import memory
+from gitscribe import console
+from gitscribe.core import hooks as hook_utils, memory
 from gitscribe.core.analysis import linter as linter_mod
 from gitscribe.core.analysis.rag import answer_query, retrieve
 from gitscribe.core.config_schema import GitScribeConfig
-from gitscribe.core.diff_parser import GitCommandError
+from gitscribe.core.diff_parser import (
+    GitCommandError,
+    _run_git,
+    diff_parser_node,
+    get_commit_messages,
+    get_raw_diff,
+)
 from gitscribe.core.graph import build_graph
 from gitscribe.core.indexer import index_store
 from gitscribe.core.llm_client import MissingAPIKeyError
 from gitscribe.core.state import GitScribeState
+from gitscribe.core.summarizer import summarizer_node
 
 # usecwd=True: resolve relative to where the command is run, not cli.py's own
 load_dotenv(find_dotenv(usecwd=True))
@@ -27,6 +36,7 @@ load_dotenv(find_dotenv(usecwd=True))
 app = typer.Typer(help="GitScribe: stateful PR description generator (LangGraph-powered)")
 
 ENV_PATH = Path(".env")
+repo_hooks_dir = Path(".git") / "hooks"
 
 
 class Style(StrEnum):
@@ -46,24 +56,24 @@ def load_config(path: str = "config.yaml") -> dict:
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
     except FileNotFoundError as e:
-        typer.secho(f"[gitscribe] config file not found: {path}", err=True, fg=typer.colors.RED)
+        console.error(f"config file not found: {path}")
         raise typer.Exit(1) from e
 
     try:
         validated = GitScribeConfig(**raw)
     except ValidationError as e:
-        typer.secho(f"[gitscribe] invalid config.yaml:\n{e}", err=True, fg=typer.colors.RED)
+        console.error(f"invalid config.yaml:\n{e}")
         raise typer.Exit(1) from e
 
     return validated.as_dict()
 
 
 def current_branch() -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True, text=True, check=True
-    )
-    return result.stdout.strip()
+    """Reuses diff_parser's git-command wrapper instead of a second
+    unguarded subprocess.run(check=True) - outside a git repo (or with git
+    missing) this now raises the same GitCommandError callers already
+    catch, instead of an uncaught CalledProcessError traceback."""
+    return _run_git(["rev-parse", "--abbrev-ref", "HEAD"]).strip()
 
 
 def is_gh_authenticated() -> bool:
@@ -94,79 +104,79 @@ def has_upstream_tracking_branch() -> bool:
 
 
 def existing_pr_url(branch: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "view", branch, "--json", "url"],
-            capture_output=True, text=True,
-        )
-    except FileNotFoundError:
-        return None  # gh missing — caller already checks shutil.which("gh") earlier in the flow
+    result = subprocess.run(
+        ["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url"],
+        capture_output=True, text=True,
+    )
     if result.returncode != 0:
         return None
     try:
-        return json.loads(result.stdout)["url"]
-    except (json.JSONDecodeError, KeyError):
+        prs = json.loads(result.stdout)
+    except json.JSONDecodeError:
         return None
+    return prs[0]["url"] if prs else None
 
 
 def require_api_key() -> None:
     """Fail fast with a clear message before invoking the graph, rather than
     letting a missing key surface as an opaque provider auth error mid-run."""
     if not os.environ.get("API_KEY"):
-        typer.secho(
-            "[gitscribe] API_KEY not set. Run `gitscribe init` or "
-            "`export API_KEY=<your-key>`.",
-            err=True, fg=typer.colors.RED,
-        )
+        console.error("API_KEY not set. Run `gitscribe init` or `export API_KEY=<your-key>`.")
         raise typer.Exit(1)
-
 
 @app.command()
 def init():
-    """Install the pre-push git hook into .git/hooks/."""
-    repo_hooks_dir = Path(".git") / "hooks"
+    """Install the pre-push, pre-merge-commit, post-merge, and commit-msg git hooks into .git/hooks/."""
     if not repo_hooks_dir.exists():
-        typer.secho(
-            "[gitscribe] .git/hooks not found - run this from a git repo root",
-            err=True, fg=typer.colors.RED,
-        )
+        console.error(".git/hooks not found - run this from a git repo root")
         raise typer.Exit(1)
 
-    src = Path(__file__).parent / "hooks" / "pre-push"
     dest = repo_hooks_dir / "pre-push"
-
     if dest.exists():
-        typer.echo(
-            f"[gitscribe] {dest} already exists - not overwriting. "
-            "Remove it first if you want to reinstall."
-        )
+        console.warn(f"{dest} already exists - not overwriting. Remove it first if you want to reinstall.")
         return
 
-    shutil.copy(src, dest)
-    if os.name == "posix":
-        dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
-    typer.echo(f"[gitscribe] installed pre-push hook at {dest}")
+    hook_names = ["pre-push", "pre-merge-commit", "post-merge", "commit-msg"]
+    for hook_name in hook_names:
+        src = Path(__file__).parent / "hooks" / f"{hook_name}.sh"
+        dest = repo_hooks_dir / hook_name  # git requires the extensionless name here
+        if not src.exists():
+            console.error(f"hook source missing: {src}")
+            raise typer.Exit(1)
+        dest.write_text(src.read_text())
+        if os.name == "posix":
+            dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
 
+    console.success(f"installed {len(hook_names)} git hooks into {repo_hooks_dir}")
     _ensure_api_key()
-
 
 def _ensure_api_key() -> None:
     """Write API_KEY to .env if not already available"""
     load_dotenv(ENV_PATH)
     if os.environ.get("API_KEY"):
-        typer.echo("[gitscribe] API_KEY already set - leaving .env untouched")
+        console.info(f"{console.PREFIX} API_KEY already set - leaving .env untouched")
         return
 
-    api_key = typer.prompt("Enter your LLM API key (provider is set in config.yaml)", hide_input=True)
+    try:
+        api_key = typer.prompt("Enter your LLM API key (provider is set in config.yaml)", hide_input=True)
+    except (typer.Abort, click.exceptions.Abort):
+        # Non-interactive context (CI, script, piped stdin) - the hook is
+        # already installed at this point, so don't fail the whole command
+        # over an optional convenience step.
+        console.warn(
+            "no interactive terminal - skipping API key setup. "
+            "Set it later with `export API_KEY=<your-key>` or re-run `gitscribe init`."
+        )
+        return
     if not api_key.strip():
-        typer.secho("[gitscribe] no key entered - skipping .env write", err=True, fg=typer.colors.YELLOW)
+        console.warn("no key entered - skipping .env write")
         return
 
     existing = ENV_PATH.read_text() if ENV_PATH.exists() else ""
     lines = [ln for ln in existing.splitlines() if ln and not ln.startswith("API_KEY=")]
     lines.append(f"API_KEY={api_key}")
     ENV_PATH.write_text("\n".join(lines) + "\n")
-    typer.echo(f"[gitscribe] wrote API_KEY to {ENV_PATH.resolve()}")
+    console.success(f"wrote API_KEY to {ENV_PATH.resolve()}")
 
 
 @app.command()
@@ -179,34 +189,53 @@ def generate(
     config = load_config()
     graph = build_graph(config)
 
-    initial_state = GitScribeState(
-        branch_name=current_branch(),
-        style=style.value,
-        attempt_count=0,
-        fallback_used=False,
-        status="pending",
-    )
-
     try:
+        initial_state = GitScribeState(
+            branch_name=current_branch(),
+            style=style.value,
+            attempt_count=0,
+            fallback_used=False,
+            status="pending",
+        )
         result = graph.invoke(initial_state)
     except GitCommandError as e:
-        typer.secho(f"[gitscribe] {e}", err=True, fg=typer.colors.RED)
+        console.error(str(e))
         raise typer.Exit(1) from e
 
-    typer.echo(f"\nTitle: {result.get('pr_title')}\n")
-    typer.echo(result.get("pr_body", "(no body generated)"))
+    console.info(f"\nTitle: {result.get('pr_title')}\n")
+    console.info(result.get("pr_body", "(no body generated)"))
 
-    if result.get("skip_generation"):
-        typer.echo("\n[skipped: diff below trivial threshold, used template fallback]")
+    status = result.get("status")
+
+    if status == "skipped":
+        console.warn("skipped: diff below trivial threshold, used template fallback")
+        return
+
+    if status == "failed":
+        # generator_node/failure_router set these before template_fallback
+        # took over; surface them instead of silently reporting success on
+        # a generic template - this used to be indistinguishable from a
+        # real successful generation.
+        reason = result.get("failure_type", "unknown")
+        last_error = (result.get("last_error") or "")[:200]
+        console.error(
+            f"LLM generation failed after {result.get('attempt_count', '?')} attempt(s) "
+            f"({reason}: {last_error}) - used a generic template instead."
+        )
+        if dry_run:
+            console.info("\n[dry-run: not saved to memory]")
+            return
+        memory.save_pr(result["branch_name"], result["pr_title"], result["pr_body"])
+        console.warn("saved fallback template to memory (not a real generated description)")
         return
 
     if dry_run:
-        typer.echo("\n[dry-run: not saved to memory]")
+        console.info("\n[dry-run: not saved to memory]")
         return
 
-    if result.get("status") == "success":
+    if status == "success":
         memory.save_pr(result["branch_name"], result["pr_title"], result["pr_body"])
-        typer.echo("\n[saved to memory]")
+        console.success("saved to memory")
 
 
 @app.command(name="create-pr")
@@ -223,46 +252,39 @@ def create_pr(
       - on the repo's default branch -> caught early with a clear message
     """
     if not shutil.which("gh"):
-        typer.secho(
-            "[gitscribe] `gh` CLI not found. Install it: https://cli.github.com",
-            err=True, fg=typer.colors.RED,
-        )
+        console.error("`gh` CLI not found. Install it: https://cli.github.com")
         raise typer.Exit(1)
     if not is_gh_authenticated():
-        typer.secho(
-            "[gitscribe] `gh` is not authenticated. Run `gh auth login` first.",
-            err=True, fg=typer.colors.RED,
-        )
+        console.error("`gh` is not authenticated. Run `gh auth login` first.")
         raise typer.Exit(1)
 
-    branch = current_branch()
+    try:
+        branch = current_branch()
+    except GitCommandError as e:
+        console.error(str(e))
+        raise typer.Exit(1) from e
     base = default_branch()
     if base and branch == base:
-        typer.secho(
-            f"[gitscribe] you're on '{branch}', the repo's default branch — "
-            "checkout a feature branch first.",
-            err=True, fg=typer.colors.RED,
-        )
+        console.error(f"you're on '{branch}', the repo's default branch — checkout a feature branch first.")
         raise typer.Exit(1)
 
     existing_url = existing_pr_url(branch)
     if existing_url:
-        typer.echo(f"[gitscribe] a PR already exists for '{branch}': {existing_url}")
+        console.info(f"{console.PREFIX} a PR already exists for '{branch}': {existing_url}")
         return
 
     if not has_upstream_tracking_branch():
         if not push:
-            typer.secho(
-                f"[gitscribe] '{branch}' has no upstream on origin. "
+            console.error(
+                f"'{branch}' has no upstream on origin. "
                 f"Push it first (`git push -u origin {branch}`) or re-run without --no-push.",
-                err=True, fg=typer.colors.RED,
             )
             raise typer.Exit(1)
-        typer.echo(f"[gitscribe] '{branch}' has no upstream — pushing to origin...")
+        console.info(f"{console.PREFIX} '{branch}' has no upstream — pushing to origin...")
         try:
             subprocess.run(["git", "push", "-u", "origin", branch], check=True)
         except subprocess.CalledProcessError as e:
-            typer.secho("[gitscribe] `git push` failed — see output above.", err=True, fg=typer.colors.RED)
+            console.error("`git push` failed — see output above.")
             raise typer.Exit(e.returncode or 1) from e
 
     require_api_key()
@@ -277,12 +299,21 @@ def create_pr(
             status="pending",
         ))
     except GitCommandError as e:
-        typer.secho(f"[gitscribe] {e}", err=True, fg=typer.colors.RED)
+        console.error(str(e))
         raise typer.Exit(1) from e
 
-    if result.get("status") != "success":
-        typer.secho("[gitscribe] generation failed, not creating PR", err=True, fg=typer.colors.RED)
+    status = result.get("status")
+    if status == "failed":
+        reason = result.get("failure_type", "unknown")
+        last_error = (result.get("last_error") or "")[:200]
+        console.error(
+            f"LLM generation failed after {result.get('attempt_count', '?')} attempt(s) "
+            f"({reason}: {last_error}) - not opening a PR with a generic template. "
+            "Check API_KEY / model config / network and retry."
+        )
         raise typer.Exit(1)
+    if status == "skipped":
+        console.warn("diff below trivial threshold - opening PR with a generic template description")
 
     try:
         subprocess.run([
@@ -291,10 +322,9 @@ def create_pr(
             "--body", result["pr_body"],
         ], check=True)
     except subprocess.CalledProcessError as e:
-        typer.secho(
-            "[gitscribe] `gh pr create` failed (see gh's output above for the reason). "
-            "PR description was generated but not opened.",
-            err=True, fg=typer.colors.RED,
+        console.error(
+            "`gh pr create` failed (see gh's output above for the reason). "
+            "PR description was generated but not opened."
         )
         raise typer.Exit(e.returncode or 1) from e
 
@@ -322,11 +352,11 @@ def index(
     stats = {"symbols": symbol_count, "edges": edge_count, "resolved_edges": resolved_count}
 
     if json_output:
-        typer.echo(json.dumps({**stats, "warning": warning}))
+        typer.echo(json.dumps({**stats, "warning": warning}, indent=2))
     else:
-        typer.echo(f"Indexed {symbol_count} symbols, {edge_count} edges ({resolved_count} resolved).")
+        console.success(f"indexed {symbol_count} symbols, {edge_count} edges ({resolved_count} resolved)")
         if warning:
-            typer.echo(warning, err=True)
+            console.warn(warning)
 
 
 @app.command()
@@ -344,18 +374,21 @@ def query(
     with no LLM call (and no cost).
     """
     config = load_config()
-    context = retrieve(text, config, top_k=top_k)
+    try:
+        context = retrieve(text, config, top_k=top_k)
+    except Exception as e:
+        console.error(f"retrieval failed: {e}")
+        raise typer.Exit(code=1) from e
 
     if not context.snippets:
-        typer.secho(
-            "No relevant symbols found for that query. Run `gitscribe index` first "
-            "if you haven't, or try rephrasing.",
-            err=True, fg=typer.colors.YELLOW,
+        console.warn(
+            "no relevant symbols found for that query. Run `gitscribe index` first "
+            "if you haven't, or try rephrasing."
         )
         raise typer.Exit(code=1)
 
     if json_output:
-        typer.echo(context.model_dump_json())
+        typer.echo(context.model_dump_json(indent=2))
         return
 
     if raw:
@@ -369,10 +402,10 @@ def query(
         typer.echo("\n--- context used ---")
         typer.echo(context.as_prompt_block())
     except MissingAPIKeyError as e:
-        typer.secho(str(e), err=True, fg=typer.colors.RED)
+        console.error(str(e))
         raise typer.Exit(code=1) from e
     except Exception as e:
-        typer.secho(f"[gitscribe] answer synthesis failed ({e}); showing raw context instead:", err=True, fg=typer.colors.YELLOW)
+        console.warn(f"answer synthesis failed ({e}); showing raw context instead:")
         typer.echo(context.as_prompt_block())
 
 
@@ -382,14 +415,22 @@ def lint(
     json_output: bool = typer.Option(False, "--json"),
     fails_on_error: bool = typer.Option(True, help="Exit 1 if any error-severity finding exists"),
 ):
-    findings = linter_mod.run_ruff(repo_root)
+    try:
+        findings = linter_mod.run_ruff(repo_root)
+    except linter_mod.RuffNotFoundError as e:
+        console.error(str(e))
+        raise typer.Exit(1) from e
 
     if json_output:
-        typer.echo(json.dumps([f.model_dump() for f in findings]))
+        typer.echo(json.dumps([f.model_dump() for f in findings], indent=2))
     else:
+        if not findings:
+            console.success("no findings")
         for f in findings:
-            typer.echo(f"{f.severity:8} {f.file}:{f.lineno}  {f.code}  {f.message}")
-        typer.echo(f"\n{len(findings)} findings, severity score {linter_mod.severity_score(findings):.2f}")
+            location = f"{f.file}:{f.lineno}"
+            console.line(f"{f.severity:8} {location:50} {f.code:6} {f.message}", severity=f.severity)
+        if findings:
+            typer.echo(f"\n{len(findings)} findings, severity score {linter_mod.severity_score(findings):.2f}")
 
     has_errors = any(f.severity == "error" for f in findings)
     if fails_on_error and has_errors:
@@ -405,10 +446,10 @@ def _find_symbol(conn, symbol: str) -> tuple[int, str]:
     if len(exact) == 1:
         return exact[0]["id"], exact[0]["name"]
     if len(exact) > 1:
-        typer.echo(f"Ambiguous symbol '{symbol}' — found in multiple files:", err=True)
+        console.error(f"ambiguous symbol '{symbol}' — found in multiple files:")
         for r in exact:
-            typer.echo(f"  {r['file']}", err=True)
-        typer.echo("Re-run with a more specific name; disambiguation by file not yet supported.", err=True)
+            console.line(f"  {r['file']}")
+        console.info("Re-run with a more specific name; disambiguation by file not yet supported.")
         raise typer.Exit(code=1)
 
     fuzzy = conn.execute(
@@ -416,16 +457,16 @@ def _find_symbol(conn, symbol: str) -> tuple[int, str]:
         (f"%{symbol}%",),
     ).fetchall()
     if not fuzzy:
-        typer.echo(f"No symbol matching '{symbol}' found. Run `gitscribe index` first?", err=True)
+        console.error(f"no symbol matching '{symbol}' found. Run `gitscribe index` first?")
         raise typer.Exit(code=1)
     if len(fuzzy) > 1:
-        typer.echo(f"No exact match for '{symbol}'. Closest matches:", err=True)
+        console.warn(f"no exact match for '{symbol}'. Closest matches:")
         for r in fuzzy:
-            typer.echo(f"  {r['name']}  ({r['file']})", err=True)
-        typer.echo("Re-run with one of the names above.", err=True)
+            console.line(f"  {r['name']}  ({r['file']})")
+        console.info("Re-run with one of the names above.")
         raise typer.Exit(code=1)
 
-    typer.echo(f"(no exact match for '{symbol}' — using closest match '{fuzzy[0]['name']}')", err=True)
+    console.warn(f"no exact match for '{symbol}' — using closest match '{fuzzy[0]['name']}'")
     return fuzzy[0]["id"], fuzzy[0]["name"]
 
 
@@ -442,11 +483,111 @@ def graph(
     results = index_store.blast_radius(symbol_id, max_depth=depth)
 
     if json_output:
-        typer.echo(json.dumps([r.model_dump() for r in results]))
-    else:
-        typer.echo(f"Blast radius for '{matched_name}' (depth {depth}):")
-        for r in results:
-            typer.echo(f"  [{r.direction:6} depth={r.depth}] {r.name} ({r.file}:{r.lineno})")
+        typer.echo(json.dumps([r.model_dump() for r in results], indent=2))
+        return
+
+    console.info(f"Blast radius for '{matched_name}' (depth {depth}):")
+    for direction, heading in (("caller", "Callers (who depends on it)"), ("callee", "Callees (what it depends on)")):
+        group = [r for r in results if r.direction == direction]
+        console.info(f"\n{heading}:")
+        if not group:
+            console.info("  (none)")
+            continue
+        for r in group:
+            indent = "  " * r.depth
+            console.info(f"{indent}└─ {r.name}  ({r.file}:{r.lineno})  [depth {r.depth}]")
+
+@app.command(name="pre-push")
+def pre_push_cmd():
+    cfg = load_config()
+    hard_block = cfg.get("hooks", {}).get("pre_push", {}).get("block_on_risk", False)
+    result = hook_utils.get_cached_risk(cfg, base="origin/main", head="HEAD")
+    threshold = cfg["risk_classifier"]["trivial_threshold"] * 3
+
+    if result["risk_score"] >= threshold:
+        print(f"⚠ high-risk diff ({result['risk_score']:.2f}): {result['risk_reasoning']}")
+        if hard_block:
+            print("blocked — override with: git push --no-verify")
+            raise typer.Exit(code=1)
+
+    has_upstream = subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", "@{u}"], capture_output=True
+    ).returncode != 0
+    if has_upstream:
+        subprocess.run(["gitscribe", "create-pr"])
+
+
+@app.command(name="merge-check")
+def merge_check_cmd():
+    cfg = load_config()
+    hard_block = cfg.get("hooks", {}).get("merge_check", {}).get("block_on_risk", False)
+    result = hook_utils.get_cached_risk(cfg, base="HEAD", head="MERGE_HEAD")
+    threshold = cfg["risk_classifier"]["trivial_threshold"] * 4
+
+    if result["risk_score"] >= threshold:
+        print(f"⚠ merge risk ({result['risk_score']:.2f}): {result['risk_reasoning']}")
+        if hard_block:
+            print("blocked — override with: git merge --no-verify")
+            raise typer.Exit(code=1)
+    print(f"✓ merge-check passed (risk {result['risk_score']:.2f})")
+
+
+@app.command(name="post-merge")
+def post_merge_cmd(ff: str = typer.Option("0")):
+    cfg = load_config()
+    branch = current_branch()
+
+    if not Path(".git/MERGE_MSG").exists() and ff == "1":
+        return  # fast-forward, nothing merged to record
+
+    diff = get_raw_diff(base="HEAD@{1}", head="HEAD")
+    commits = get_commit_messages(base="HEAD@{1}", head="HEAD")
+    state = GitScribeState(branch_name=branch, raw_diff=diff, commit_messages=commits)
+
+    files = diff_parser_node(state, cfg)
+    state.files_changed = files["files_changed"]
+    summary = summarizer_node(state)
+    memory.save_pr(branch, title=f"Merged: {branch}", body="\n".join(summary["change_summary"]))
+
+    if cfg.get("hooks", {}).get("post_merge", {}).get("auto_tag", False):
+        bump = hook_utils.BUMP_FILE.read_text().strip() if hook_utils.BUMP_FILE.exists() else "patch"
+        tag = hook_utils.next_tag(bump)
+        subprocess.run(["git", "tag", tag])
+        print(f"gitscribe: tagged {tag} ({bump})")
+        if cfg["hooks"]["post_merge"].get("push_tag", False):
+            subprocess.run(["git", "push", "origin", tag])
+
+
+@app.command(name="commit-msg")
+def commit_msg_cmd(msg_file: str = typer.Argument(...)):
+    cfg = load_config()
+    if not cfg.get("hooks", {}).get("commit_msg", {}).get("enabled", True):
+        return
+
+    raw = Path(msg_file).read_text()
+    subject = raw.splitlines()[0] if raw.splitlines() else ""
+    if subject.startswith(("Merge ", "Revert ")):
+        return
+
+    if not hook_utils.COMMIT_RE.match(subject):
+        print(f"✗ not a Conventional Commit:\n  {subject}", file=sys.stderr)
+        print("  format: <type>(<scope>)!: <description>", file=sys.stderr)
+        print("  types: feat fix build chore ci docs style refactor perf test", file=sys.stderr)
+        raise typer.Exit(code=1)
+
+    bump = hook_utils.bump_for_commit(subject, raw)
+    hook_utils.BUMP_FILE.write_text(bump)
+
+
+@app.command(name="merge-conflict")
+def merge_conflict_cmd():
+    files = hook_utils.conflicted_files()
+    if not files:
+        print("No conflicts detected.")
+        return
+    print(f"gitscribe: {len(files)} file(s) with conflicts:")
+    for f in files:
+        print(f"  - {f}")
 
 
 if __name__ == "__main__":

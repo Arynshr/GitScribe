@@ -54,17 +54,25 @@ class BlastRadiusResult(BaseModel):
 
 
 def _get_connection() -> sqlite3.Connection:
+    """Self-healing, same convention as memory.py's get_connection(): every
+    connection ensures the schema exists (CREATE TABLE IF NOT EXISTS is a
+    no-op once it does). Without this, `gitscribe graph`/`gitscribe query`
+    raised a raw `no such table: symbols` if run before `gitscribe index`
+    had ever created the DB file.
+    """
     INDEX_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(INDEX_DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(SCHEMA_PATH.read_text())
     return conn
 
 
 def init_schema() -> None:
+    """Kept as an explicit public entry point (cli.py's `index` command
+    calls it before rebuild_index) - now just a thin, harmless wrapper
+    since _get_connection() is self-healing too."""
     conn = _get_connection()
-    conn.executescript(SCHEMA_PATH.read_text())
-    conn.commit()
     conn.close()
 
 
