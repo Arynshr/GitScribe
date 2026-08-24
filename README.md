@@ -1,18 +1,6 @@
 # GitScribe
 
-**A local-first, BYOK code intelligence CLI — it writes your PR descriptions, indexes your codebase into a queryable symbol graph, and enforces commit/merge hygiene, all from git hooks running in your own repo, on your own LLM key.**
----
-
-## What is GitScribe?
-
-GitScribe started as a stateful, LangGraph-powered PR description generator. It has grown into a **local code intelligence platform**: a provider-agnostic CLI that indexes your codebase into a SQLite symbol graph, answers questions about it via RAG, surfaces blast-radius/dependency analysis, wraps `ruff` for lint findings, and automates PR generation and git hygiene through installable hooks — all without a server, a SaaS account, or your code ever leaving your machine except to whichever LLM provider you've configured.
-
-**Design principles:**
-- **Local-first** — SQLite, not a hosted graph DB or vector store. Your code and PR history stay on disk.
-- **BYOK (Bring Your Own Key)** — one `API_KEY` env var, provider selected in `config.yaml` (Groq, OpenAI, Anthropic, or anything `langchain.chat_models.init_chat_model` supports). You pay your provider directly; GitScribe has no billing layer.
-- **Fail-safe by default** — LLM calls that fail retry, then fall back to a secondary model, then fall back to a template. Nothing blocks your workflow because a provider had a bad minute.
-- **Embedded in your workflow, not bolted on** — installs as real git hooks (`pre-push`, `pre-merge-commit`, `post-merge`, `commit-msg`), not a separate dashboard you have to remember to check.
-
+#### A local-first, BYOK code intelligence CLI — it writes your PR descriptions, indexes your codebase into a queryable symbol graph, and enforces commit/merge hygiene, all from git hooks running in your own repo, on your own LLM key.
 ---
 
 ## Features
