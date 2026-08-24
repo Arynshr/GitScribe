@@ -1,83 +1,168 @@
 # GitScribe
 
-Stateful, LangGraph-powered PR description generator. Analyzes your git diff and commit history, pulls relevant past PRs from local memory, and generates a structured PR description via an LLM (provider-agnostic: groq/openai/anthropic/etc.).
+**A local-first, BYOK code intelligence CLI — it writes your PR descriptions, indexes your codebase into a queryable symbol graph, and enforces commit/merge hygiene, all from git hooks running in your own repo, on your own LLM key.**
+---
+
+## What is GitScribe?
+
+GitScribe started as a stateful, LangGraph-powered PR description generator. It has grown into a **local code intelligence platform**: a provider-agnostic CLI that indexes your codebase into a SQLite symbol graph, answers questions about it via RAG, surfaces blast-radius/dependency analysis, wraps `ruff` for lint findings, and automates PR generation and git hygiene through installable hooks — all without a server, a SaaS account, or your code ever leaving your machine except to whichever LLM provider you've configured.
+
+**Design principles:**
+- **Local-first** — SQLite, not a hosted graph DB or vector store. Your code and PR history stay on disk.
+- **BYOK (Bring Your Own Key)** — one `API_KEY` env var, provider selected in `config.yaml` (Groq, OpenAI, Anthropic, or anything `langchain.chat_models.init_chat_model` supports). You pay your provider directly; GitScribe has no billing layer.
+- **Fail-safe by default** — LLM calls that fail retry, then fall back to a secondary model, then fall back to a template. Nothing blocks your workflow because a provider had a bad minute.
+- **Embedded in your workflow, not bolted on** — installs as real git hooks (`pre-push`, `pre-merge-commit`, `post-merge`, `commit-msg`), not a separate dashboard you have to remember to check.
+
+---
+
+## Features
+
+### PR Generation
+- Analyzes `git diff` + commit history, retrieves relevant past PRs from local memory, and generates a structured PR description (title, summary, changes, testing notes, impact) via your configured LLM
+- **Risk-gated**: trivial diffs (formatting, version bumps) skip the LLM call entirely and use a template — saves API cost and noise
+- **Adaptive retrieval**: pulls past PRs by branch prefix, widens the search (bounded) if the LLM judges the initial context insufficient
+- **Failure-safe generation**: retry same model → retry fallback model → template fallback, so a provider outage never blocks a push
+- Three output styles: `default`, `concise`, `detailed`
+- `gitscribe create-pr` opens the PR directly via GitHub CLI (`gh`)
+
+### Codebase Indexing & Analysis
+- `gitscribe index` — parses your Python source (stdlib `ast`) into a symbol table, resolves call/import edges into a graph, and computes local embeddings (`sentence-transformers`, no API cost) — all in SQLite, full rebuild per run
+- `gitscribe query "<question>"` — RAG: embeds your question, vector-searches the symbol graph, expands via blast-radius, and either returns raw grounded context (`--raw`/`--json`, no LLM call) or synthesizes a cited natural-language answer
+- `gitscribe graph <symbol>` — blast-radius / dependency view: who calls this, what does it call, to what depth
+- `gitscribe lint` — wraps `ruff`, normalizes findings into a shared schema, exits non-zero on error-severity findings (CI-friendly)
+
+### Git Hygiene Automation
+Installed via `gitscribe init`, these run as real hooks — no separate process to remember:
+- **`pre-push`** — flags high-risk diffs (configurable hard block), auto-opens a PR if the branch has an upstream
+- **`pre-merge-commit`** — risk-scores the incoming merge before it lands
+- **`post-merge`** — records the merge to PR memory; can auto-tag using Conventional Commits-derived semver bumps
+- **`commit-msg`** — enforces Conventional Commits format at commit time
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/Arynshr/GitScribe.git
+cd GitScribe
+pip install -e .
+```
+
+Requires **Python 3.13+**. Registers the `gitscribe` command via `[project.scripts]`.
+
+---
+
+## Quickstart
+
+```bash
+# from your project repo root
+gitscribe init                        # installs git hooks, prompts for your LLM API key -> .env
+
+# PR generation
+gitscribe generate --style concise    # print a PR description, save to local memory
+gitscribe create-pr                   # generate + open a PR via `gh`
+
+# codebase intelligence
+gitscribe index                       # build the symbol graph + embeddings
+gitscribe query "how does risk scoring work?"
+gitscribe graph risk_classifier_node  # blast radius for a symbol
+gitscribe lint                        # ruff findings, normalized
+```
+
+`.env` holds a single `API_KEY` regardless of provider — set `llm.provider` in `config.yaml` and the same key is reused across `generate`, `query`, and every LLM-backed node. You can also just `export API_KEY=...`.
+
+---
 
 ## How it works
+
+### PR generation pipeline (LangGraph DAG)
 
 ```
 diff_parser → summarizer → risk_classifier → retriever → generator → (failure_router on error)
 ```
 
-- **diff_parser** — `git diff origin/main...HEAD`, filtered by `.gitignore` / `ignore_patterns`
-- **risk_classifier** — scores the diff 0–1; skips generation below `risk_classifier.trivial_threshold` and falls back to a template
-- **retriever** — pulls past PRs by branch prefix from local memory, widens the search if the LLM judges them insufficiently relevant (bounded to 2 iterations)
-- **generator** — builds the prompt from the diff summary + retrieved PRs + style, calls the LLM, parses a structured `PRDescription`
-- **failure_router** — on LLM failure: retry same model → retry fallback model → template fallback
+| Node | Responsibility |
+|---|---|
+| `diff_parser` | `git diff origin/main...HEAD`, filtered by `.gitignore` / `ignore_patterns` |
+| `summarizer` | Condenses the raw diff into a per-file change summary |
+| `risk_classifier` | Scores the diff 0.0–1.0; below `trivial_threshold` → skip generation, use template |
+| `retriever` | Pulls past PRs from local memory by branch prefix; widens (bounded, ≤2 iterations) if the LLM judges results insufficient |
+| `generator` | Builds the prompt from diff summary + retrieved PRs + style, calls the LLM, parses a structured `PRDescription` |
+| `failure_router` | On LLM failure: retry same model → retry fallback model → template fallback |
 
-State flows through a single `GitScribeState` object across the graph. History persists to local SQLite (`Storage/gitscribe.db`, gitignored — see note below).
+State flows through a single `GitScribeState` object across the graph. PR history persists to local SQLite (`Storage/gitscribe.db`, gitignored).
 
-## Install
+### Indexing & analysis pipeline
 
-```bash
-pip install -e .
+```
+parser (ast) → graph_builder (call/import edges) → embedder (local) → index_store (public API)
 ```
 
-This registers the `gitscribe` command via `[project.scripts]`.
+`index_store.py` exposes `search()` and `blast_radius()` as the stable public API — both `gitscribe query`/`graph` and internal callers (e.g. `analysis/rag.py`) go through it rather than touching SQLite directly. `analysis/rag.py` composes `search()` + `blast_radius()` into ranked, deduplicated context blocks for the `query` command. `analysis/linter.py` wraps `ruff` and `analysis/semantic_checks.py` runs graph queries (cycle detection, dead-code reachability, fan-in/out) over the same index.
 
-## Setup
+---
 
-```bash
-gitscribe init          # installs pre-push hook, prompts for your LLM API key -> writes .env
-```
+## CLI reference
 
-`.env` holds a single `API_KEY` regardless of provider — set `llm.provider` in `config.yaml` (groq/openai/anthropic/...) and the same key works. You can also just `export API_KEY=...` instead of using `.env`.
+| Command | Purpose |
+|---|---|
+| `gitscribe init` | Installs `pre-push`, `pre-merge-commit`, `post-merge`, `commit-msg` hooks; prompts for `API_KEY` |
+| `gitscribe generate [--style] [--dry-run]` | Generate a PR description for the current branch's diff |
+| `gitscribe create-pr [--style] [--push/--no-push]` | Generate + open a PR via `gh` |
+| `gitscribe index [--repo-root] [--json]` | Build/refresh the symbol graph + embeddings (full rebuild) |
+| `gitscribe query <text> [--top-k] [--raw] [--json]` | RAG-grounded question answering over the indexed codebase |
+| `gitscribe graph <symbol> [--depth] [--json]` | Blast-radius / dependency view for a symbol (exact or fuzzy match) |
+| `gitscribe lint [--repo-root] [--json] [--fails-on-error]` | Ruff findings, normalized, with a severity score |
 
-## Usage
+Hook-only subcommands (`pre-push`, `merge-check`, `post-merge`, `commit-msg`, `merge-conflict`) are invoked by the installed git hooks and generally aren't run manually.
 
-```bash
-gitscribe generate --style concise           # print description, save to memory
-gitscribe generate --dry-run                 # print description, skip saving
-gitscribe create-pr --style concise          # generate + open PR via `gh` (needs `gh auth login`)
-```
-
-`--style`: `default` | `concise` | `detailed`
-
-## Config (`config.yaml`)
-
-| Key | Default | Notes |
-|---|---|---|
-| `llm.provider` | `groq` | any provider `langchain.chat_models.init_chat_model` supports |
-| `llm.model` / `llm.fallback_model` | — | primary / retry-fallback model |
-| `llm.base_url` | `null` | optional, for self-hosted or custom-endpoint providers |
-| `retrieval.min_prs` / `max_prs` | 3 / 10 | retrieval depth bounds |
-| `risk_classifier.trivial_threshold` | 0.15 | below this, generation is skipped |
-| `failure_handling.max_retries` | 2 | before falling back to template |
+---
 
 ## Project layout
 
 ```
 src/gitscribe/
-├── cli.py                 # typer CLI: init, generate, create-pr
+├── cli.py                        # typer CLI: all commands above
+├── console.py                    # shared output formatting
+├── hooks/                        # installable shell hooks (pre-push.sh, post-merge.sh, ...)
 └── core/
-    ├── diff_parser.py
-    ├── summarizer.py
-    ├── risk_classifier.py
-    ├── retriever.py
-    ├── generator.py
-    ├── llm_client.py       # provider-agnostic chat-model factory
-    ├── failure_router.py
-    ├── graph.py             # LangGraph wiring
-    ├── state.py             # GitScribeState
-    ├── memory.py            # SQLite persistence, self-initializing schema
-    ├── telemetry.py
-    └── config_schema.py
+    ├── llm_client.py             # provider-agnostic chat-model factory (BYOK)
+    ├── diff_parser.py            # git diff extraction + .gitignore-aware filtering
+    ├── summarizer.py             # diff -> per-file change summary
+    ├── risk_classifier.py        # 0-1 risk scoring, trivial-diff gating
+    ├── retriever.py              # adaptive past-PR retrieval from memory
+    ├── generator.py              # structured PRDescription generation
+    ├── failure_router.py         # retry -> fallback model -> template chain
+    ├── graph.py                  # LangGraph DAG wiring
+    ├── state.py                  # GitScribeState
+    ├── memory.py                 # SQLite PR history, self-initializing schema
+    ├── telemetry.py              # LLM call logging
+    ├── hooks.py                  # hook-command business logic (risk caching, semver bump, conflict detection)
+    ├── config_schema.py          # pydantic-validated config.yaml
+    ├── indexer/
+    │   ├── parser.py             # stdlib `ast` symbol extraction
+    │   ├── graph_builder.py      # call/import edge resolution
+    │   ├── embedder.py           # local sentence-transformers embeddings
+    │   ├── index_store.py        # public API: search(), blast_radius()
+    │   └── schema.sql            # symbols / edges / embeddings tables
+    └── analysis/
+        ├── rag.py                # query -> embed -> search -> graph-expand -> context
+        ├── linter.py             # ruff wrapper, normalized findings
+        └── semantic_checks.py    # cycles, dead code, fan-in/out over the graph
 ```
 
-## Known limitations
+---
 
-- Diff base is hardcoded to `origin/main...HEAD` (no `--base` flag yet)
-- `Storage/gitscribe.db` is local, per-machine memory — gitignore it, don't commit it
+## Testing
 
-## Status: v0.1 baseline
+```bash
+pytest
+```
 
-Diff extraction, risk-gated generation, adaptive retrieval, failure fallback chain, dry-run mode, and self-initializing local memory all working end to end.
+Test suite covers pipeline nodes (`test_generator`, `test_retriever`, `test_risk_classifier`, `test_failure_router`, `test_graph`), config validation (`test_config_schema`), and the indexing/analysis layer (`test_parser`, `test_graph_builder`, `test_embedder`, `test_index_store`, `test_rag`, `test_linter`, `test_semantic_checks`, `test_memory`).
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
