@@ -71,8 +71,12 @@ def next_tag(bump: str) -> str:
     return f"v{major}.{minor}.{patch + 1}"
 
 
-def conflicted_files() -> list[str]:
+def conflicted_files(cwd: str | Path | None = None) -> list[str]:
+    """`cwd` lets merge_preview.worktree reuse this against a disposable
+    worktree instead of re-implementing conflict detection there.
+    """
     result = subprocess.run(
-        ["git", "diff", "--diff-filter=U", "--name-only"], capture_output=True, text=True
+        ["git", "diff", "--diff-filter=U", "--name-only"],
+        capture_output=True, text=True, cwd=cwd,
     )
     return [f for f in result.stdout.splitlines() if f]

@@ -1,9 +1,4 @@
 """
-core/indexer/index_store.py
-Stage 2, Step 5: public API for the code index. This is the ONLY module
-Stage 3 (RAG/analysis) and Stage 4 (CLI: `gitscribe index/query/graph`)
-should import from — parser/graph_builder/embedder stay internal.
-
 Typed request/response models (Pydantic), consistent with state.py's
 pattern — not raw dicts across the public boundary.
 """
@@ -25,16 +20,10 @@ from gitscribe.core.indexer.embedder import (
 from gitscribe.core.indexer.graph_builder import Edge, build_edges
 from gitscribe.core.indexer.parser import Symbol, parse_repo
 
-# Path.cwd()-relative by design (mirrors memory.py's convention): the CLI
-# is expected to be run from the repo root, same as `git` itself would be.
-# Kept as a module-level Path (not a string) so it round-trips through
-# sqlite3.connect() and pathlib operations identically on Windows/macOS/Linux.
 INDEX_DB_PATH = Path.cwd() / "Storage" / "gitscribe_index.db"
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 Direction = Literal["caller", "callee"]
-
-
 class SearchResult(BaseModel):
     symbol_id: int
     name: str
@@ -42,7 +31,6 @@ class SearchResult(BaseModel):
     file: str
     lineno: int
     score: float
-
 
 class BlastRadiusResult(BaseModel):
     symbol_id: int
@@ -52,13 +40,8 @@ class BlastRadiusResult(BaseModel):
     direction: Direction = "callee"
     lineno: int = 0
 
-
 def _get_connection() -> sqlite3.Connection:
-    """Self-healing, same convention as memory.py's get_connection(): every
-    connection ensures the schema exists (CREATE TABLE IF NOT EXISTS is a
-    no-op once it does). Without this, `gitscribe graph`/`gitscribe query`
-    raised a raw `no such table: symbols` if run before `gitscribe index`
-    had ever created the DB file.
+    """Self-healing, same convention as memory.py's get_connection()
     """
     INDEX_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(INDEX_DB_PATH)
@@ -70,8 +53,7 @@ def _get_connection() -> sqlite3.Connection:
 
 def init_schema() -> None:
     """Kept as an explicit public entry point (cli.py's `index` command
-    calls it before rebuild_index) - now just a thin, harmless wrapper
-    since _get_connection() is self-healing too."""
+    calls it before rebuild_index)"""
     conn = _get_connection()
     conn.close()
 
@@ -79,9 +61,6 @@ def init_schema() -> None:
 def rebuild_index(repo_root: str, cfg: dict) -> str | None:
     """Full rebuild per run (Stage 2 policy). Wipes and re-populates
     symbols/edges/embeddings — cascade deletes keep it consistent.
-    Returns a warning string if embeddings were skipped (e.g. missing
-    optional dependency); None on full success. Symbols/edges are usable
-    either way — only `search()` depends on embeddings existing.
     """
     symbols = parse_repo(repo_root)
 
@@ -119,9 +98,6 @@ def rebuild_index(repo_root: str, cfg: dict) -> str | None:
             )
             conn.commit()
         except Exception as e:
-            # Symbols/edges are already committed above — graph/blast_radius
-            # stay usable even if embeddings fail (missing dep, no network,
-            # OOM, etc.). Only search() needs embeddings.
             embedding_error = (
                 f"Embeddings skipped ({type(e).__name__}: {e}). Install/verify the embedding "
                 "extra (e.g. `pip install sentence-transformers`) and network access, then "
@@ -134,9 +110,6 @@ def rebuild_index(repo_root: str, cfg: dict) -> str | None:
 
 def search(query: str, cfg: dict, top_k: int = 10) -> list[SearchResult]:
     """Embed the query, brute-force cosine against stored vectors.
-    Brute-force is fine at current expected symbol counts; sqlite-vec
-    is the documented upgrade path once measured as a bottleneck —
-    not built preemptively.
     """
     from gitscribe.core.indexer.embedder import _get_local_model
 
@@ -174,9 +147,6 @@ def search(query: str, cfg: dict, top_k: int = 10) -> list[SearchResult]:
     ]
 
 
-# Two independent, single-direction recursive CTEs (not one combined
-# bidirectional CTE) so direction is never ambiguous. GROUP BY s.id keeps
-# the shortest depth per symbol when multiple paths reach it.
 _CALLEE_CTE = """
 WITH RECURSIVE reach(id, depth) AS (
     SELECT ?, 0
@@ -233,3 +203,30 @@ def blast_radius(symbol_id: int, max_depth: int = 3) -> list[BlastRadiusResult]:
 
     results.sort(key=lambda r: (r.depth, r.direction, r.name))
     return results
+
+
+def symbol_at(file: str, lineno: int) -> SearchResult | None:
+    """Find the innermost symbol (function/method/class) whose [lineno,
+    end_lineno] range contains `lineno` in `file`. Added for merge_preview's
+    context-gathering (map a conflicted hunk's line range to a symbol so
+    blast_radius() can be queried against it)
+
+    Returns the smallest matching range (most specific symbol — a method
+    over its enclosing class) when several ranges contain the line. Score
+    is unused here and always 0.0; callers that need ranking should use
+    `search()` instead.
+    """
+    conn = _get_connection()
+    row = conn.execute(
+        "SELECT id, name, kind, file, lineno, end_lineno FROM symbols "
+        "WHERE file = ? AND lineno <= ? AND (end_lineno IS NULL OR end_lineno >= ?) "
+        "ORDER BY (COALESCE(end_lineno, lineno) - lineno) ASC LIMIT 1",
+        (file, lineno, lineno),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return SearchResult(
+        symbol_id=row["id"], name=row["name"], kind=row["kind"],
+        file=row["file"], lineno=row["lineno"], score=0.0,
+    )
