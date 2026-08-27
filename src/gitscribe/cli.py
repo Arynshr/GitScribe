@@ -27,6 +27,7 @@ from gitscribe.core.diff_parser import (
 from gitscribe.core.graph import build_graph
 from gitscribe.core.indexer import index_store
 from gitscribe.core.llm_client import MissingAPIKeyError
+from gitscribe.core.merge_preview import WorktreeError, run_merge_preview
 from gitscribe.core.state import GitScribeState
 from gitscribe.core.summarizer import summarizer_node
 
@@ -148,7 +149,37 @@ def init():
             dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
 
     console.success(f"installed {len(hook_names)} git hooks into {repo_hooks_dir}")
+    _ensure_merge_preview_alias()
     _ensure_api_key()
+
+
+def _ensure_merge_preview_alias() -> None:
+    """Registers `git merge-preview <branch>` as a shortcut for
+    `gitscribe merge-preview <branch>`, auto-configured here so users get
+    it for free from `gitscribe init` rather than a separate manual step.
+    Merge-preview isn't a real git hook (git has no hook that fires on a
+    conflict — it skips pre-merge-commit entirely when the merge stops
+    short on conflicts), so a git alias is the closest "native-feeling"
+    integration point available.
+    """
+    existing = subprocess.run(
+        ["git", "config", "--get", "alias.merge-preview"], capture_output=True, text=True
+    )
+    if existing.returncode == 0 and existing.stdout.strip() and "gitscribe merge-preview" not in existing.stdout:
+        console.warn(
+            f"git alias 'merge-preview' already set to '{existing.stdout.strip()}' - leaving it alone"
+        )
+        return
+
+    result = subprocess.run(
+        ["git", "config", "alias.merge-preview", "!gitscribe merge-preview"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        console.warn(f"could not configure `git merge-preview` alias: {result.stderr.strip()}")
+        return
+    console.success("configured `git merge-preview <branch>` as a shortcut for `gitscribe merge-preview <branch>`")
+
 
 def _ensure_api_key() -> None:
     """Write API_KEY to .env if not already available"""
@@ -588,6 +619,66 @@ def merge_conflict_cmd():
     print(f"gitscribe: {len(files)} file(s) with conflicts:")
     for f in files:
         print(f"  - {f}")
+
+
+@app.command(name="merge-preview")
+def merge_preview_cmd(
+    branch: str = typer.Argument(..., help="Branch to speculatively merge"),
+    base: str = typer.Option("HEAD", help="Ref to merge into (defaults to the current branch)"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON instead of formatted text"),
+):
+    """Speculatively merge `branch` into `base` inside a disposable worktree
+    and, if it conflicts, propose a resolution per hunk grounded in blast
+    radius and each branch's recovered PR intent. Never touches your real
+    working tree, index, or branches — nothing here is auto-applied.
+
+    Also available as `git merge-preview <branch>` after `gitscribe init`.
+    """
+    cfg = load_config()
+    require_api_key()
+    ours = current_branch()
+
+    try:
+        report = run_merge_preview(cfg, ours_branch=ours, theirs_branch=branch, base_ref=base)
+    except (WorktreeError, MissingAPIKeyError) as e:
+        console.error(str(e))
+        raise typer.Exit(1) from e
+
+    if json_output:
+        typer.echo(report.model_dump_json(indent=2))
+        return
+
+    if report.clean:
+        console.success(f"no conflicts merging '{branch}' into '{ours}'")
+        return
+
+    console.warn(
+        f"{report.total_hunks} conflict(s) across {len(report.files)} file(s) "
+        f"merging '{branch}' into '{ours}'"
+    )
+    for file_report in report.files:
+        console.info(f"\n{file_report.file}")
+        if not file_report.resolutions:
+            console.line("  binary or unparseable - resolve manually", severity="warning")
+            continue
+
+        for res in file_report.resolutions:
+            tag = "escalated" if res.escalated else "batch"
+            severity = "info" if res.confidence == "high" else "warning"
+            console.line(f"  hunk {res.hunk_index} - confidence: {res.confidence} ({tag})", severity=severity)
+            console.info(f"    {res.rationale}")
+            if res.confidence == "high":
+                console.info("    proposed resolution:")
+                for line in res.resolved_text.splitlines():
+                    console.info(f"      {line}")
+            else:
+                console.info("    -> flagged for manual review, not shown as a proposal")
+
+    console.info(
+        f"\n{report.total_safe}/{report.total_hunks} hunk(s) high-confidence. "
+        "Nothing has been applied — this is a preview. Run the real merge "
+        "yourself once you've reviewed it."
+    )
 
 
 if __name__ == "__main__":

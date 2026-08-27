@@ -30,6 +30,36 @@ def test_trivial_threshold_out_of_range_raises():
         GitScribeConfig(**VALID_RAW, risk_classifier={"trivial_threshold": 1.5})
 
 
+def test_merge_preview_defaults():
+    cfg = GitScribeConfig(**VALID_RAW)
+    assert cfg.merge_preview.escalate_below_confidence == "high"
+    assert cfg.merge_preview.blast_radius_depth == 2
+    assert cfg.merge_preview.worktree_cleanup is True
+
+
+def test_merge_preview_invalid_confidence_level_raises():
+    with pytest.raises(ValidationError):
+        GitScribeConfig(**VALID_RAW, merge_preview={"escalate_below_confidence": "extreme"})
+
+
+def test_merge_preview_blast_radius_depth_must_be_positive():
+    with pytest.raises(ValidationError):
+        GitScribeConfig(**VALID_RAW, merge_preview={"blast_radius_depth": 0})
+
+
+def test_merge_preview_as_dict_round_trips_through_as_dict():
+    """as_dict() (model_dump()) must include merge_preview, since cli.py's
+    load_config() callers read cfg["merge_preview"][...] as a plain dict —
+    this is exactly the bug that made the pre-existing `hooks:` config
+    section silently inert (never declared on GitScribeConfig, so
+    model_dump() drops it).
+    """
+    cfg = GitScribeConfig(**VALID_RAW)
+    as_dict = cfg.as_dict()
+    assert "merge_preview" in as_dict
+    assert as_dict["merge_preview"]["escalate_below_confidence"] == "high"
+
+
 def test_as_dict_matches_node_access_pattern():
     cfg = GitScribeConfig(**VALID_RAW)
     d = cfg.as_dict()
