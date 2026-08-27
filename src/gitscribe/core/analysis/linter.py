@@ -12,6 +12,7 @@ import subprocess
 
 from pydantic import BaseModel
 
+from gitscribe.core.indexer.index_store import _get_connection
 
 class LintFinding(BaseModel):
     file: str
@@ -82,3 +83,42 @@ def severity_score(findings: list[LintFinding]) -> float:
         return 0.0
     errors = sum(1 for f in findings if f.severity == "error")
     return errors / len(findings)
+
+def _symbol_id_for(conn, file: str, lineno: int) -> int | None:
+    """Line-range containment lookup — smallest enclosing symbol wins
+    (e.g. a method inside a class), so ORDER BY range size ascending."""
+    row = conn.execute(
+        """SELECT id FROM symbols
+           WHERE file = ? AND lineno <= ?
+             AND (end_lineno IS NULL OR end_lineno >= ?)
+           ORDER BY (COALESCE(end_lineno, lineno) - lineno) ASC
+           LIMIT 1""",
+        (file, lineno, lineno),
+    ).fetchone()
+    return row["id"] if row else None
+ 
+ 
+def write_lint_findings(findings: list[LintFinding]) -> int:
+    """Maps each finding to a symbol_id (NULL for module-level findings
+    with no enclosing symbol, per spec §3.2) and writes to
+    review_findings with source='lint'. Returns count written.
+    """
+    conn = _get_connection()
+    for f in findings:
+        symbol_id = _symbol_id_for(conn, f.file, f.lineno)
+        conn.execute(
+            """INSERT INTO review_findings
+               (symbol_id, source, severity, rule_or_reason, message, line_start, line_end)
+               VALUES (?, 'lint', ?, ?, ?, ?, ?)""",
+            (symbol_id, f.severity, f.code, f.message, f.lineno, f.lineno),
+        )
+    conn.commit()
+    return len(findings)
+ 
+ 
+def run_lint_review(repo_root: str = ".") -> int:
+    """Entry point for `gitscribe review --lint-only` (spec §3.6/§3.7):
+    deterministic, no LLM call, runs regardless of Merkle skip state.
+    """
+    findings = run_ruff(repo_root)
+    return write_lint_findings(findings)
