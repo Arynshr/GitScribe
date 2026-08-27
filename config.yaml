@@ -13,15 +13,24 @@ retrieval:
 risk_classifier:
   enabled: true
   trivial_threshold: 0.15
+  structural_weight: 0.3
 
 failure_handling:
   max_retries: 2
   retry_backoff_seconds: 2
 
 merge_preview:
-  escalate_below_confidence: high  
+  escalate_below_confidence: high
   blast_radius_depth: 2
-  worktree_cleanup: true      
+  worktree_cleanup: true
+
+review:
+  lint:
+    enabled: true
+  agentic:
+    enabled: true
+    max_context_tokens: 6000
+    hops: 2
 
 hooks:
   pre_push:
@@ -33,7 +42,7 @@ hooks:
     push_tag: false
   commit_msg:
     enabled: true
-
+    
 ignore_patterns:
   - "*.lock"
   - "poetry.lock"
