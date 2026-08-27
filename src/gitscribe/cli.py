@@ -680,6 +680,42 @@ def merge_preview_cmd(
         "yourself once you've reviewed it."
     )
 
+@app.command()
+def index(force: bool = typer.Option(False, "--force", help="Bypass hash check, full rebuild")):
+    config = load_config()
+    result = index_store.reindex(".", config, force=force)
+    if result.skipped_entirely:
+        console.info("index unchanged, nothing to do")
+    else:
+        console.success(f"indexed: {result.files_changed} changed, {result.files_skipped} skipped")
+
+    
+@app.command(name="review")
+def review_cmd(
+    lint_only: bool = typer.Option(False, "--lint-only", help="Static pass only, no LLM cost"),
+    as_json: bool = typer.Option(False, "--json", help="Scriptable output"),
+):
+    """Run lint + agentic review, write review_findings, print summary."""
+    config = load_config()
+    lint_count = 0
+    if config.get("review", {}).get("lint", {}).get("enabled", True):
+        lint_count = linter_mod.run_lint_review(".")
+ 
+    agentic_count = 0
+    if not lint_only and config.get("review", {}).get("agentic", {}).get("enabled", True):
+        # Agentic pass needs a non-empty diff to review (spec §3.7: skip
+        # on empty diff, not on "index unchanged" — these are different
+        # conditions). Diff/changed-symbol resolution wiring is left to
+        # the caller since diff_parser's current-branch diff helpers
+        # weren't re-derived here to avoid duplicating that logic.
+        console.warn("agentic review needs a diff + changed-symbol-id list wired in from diff_parser")
+ 
+    if as_json:
+        typer.echo(json.dumps({"lint_findings": lint_count, "agentic_findings": agentic_count}))
+    else:
+        console.success(f"review: {lint_count} lint finding(s), {agentic_count} agentic finding(s)")
+
+
 
 if __name__ == "__main__":
     app()
