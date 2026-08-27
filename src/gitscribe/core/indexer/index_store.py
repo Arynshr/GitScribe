@@ -24,6 +24,8 @@ INDEX_DB_PATH = Path.cwd() / "Storage" / "gitscribe_index.db"
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 Direction = Literal["caller", "callee"]
+
+
 class SearchResult(BaseModel):
     symbol_id: int
     name: str
@@ -32,16 +34,20 @@ class SearchResult(BaseModel):
     lineno: int
     score: float
 
+
 class BlastRadiusResult(BaseModel):
     symbol_id: int
     name: str
     file: str
-    depth: int  # hops from the queried symbol
+    depth: int
     direction: Direction = "callee"
     lineno: int = 0
 
+
 def _get_connection() -> sqlite3.Connection:
-    """Self-healing, same convention as memory.py's get_connection()
+    """Self-healing, same convention as memory.py's get_connection(): every
+    connection ensures the schema exists (CREATE TABLE IF NOT EXISTS is a
+    no-op once it does).
     """
     INDEX_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(INDEX_DB_PATH)
@@ -110,6 +116,9 @@ def rebuild_index(repo_root: str, cfg: dict) -> str | None:
 
 def search(query: str, cfg: dict, top_k: int = 10) -> list[SearchResult]:
     """Embed the query, brute-force cosine against stored vectors.
+    Brute-force is fine at current expected symbol counts; sqlite-vec
+    is the documented upgrade path once measured as a bottleneck —
+    not built preemptively.
     """
     from gitscribe.core.indexer.embedder import _get_local_model
 
@@ -145,7 +154,6 @@ def search(query: str, cfg: dict, top_k: int = 10) -> list[SearchResult]:
         )
         for row, score in scored[:top_k]
     ]
-
 
 _CALLEE_CTE = """
 WITH RECURSIVE reach(id, depth) AS (
@@ -208,13 +216,7 @@ def blast_radius(symbol_id: int, max_depth: int = 3) -> list[BlastRadiusResult]:
 def symbol_at(file: str, lineno: int) -> SearchResult | None:
     """Find the innermost symbol (function/method/class) whose [lineno,
     end_lineno] range contains `lineno` in `file`. Added for merge_preview's
-    context-gathering (map a conflicted hunk's line range to a symbol so
-    blast_radius() can be queried against it)
-
-    Returns the smallest matching range (most specific symbol — a method
-    over its enclosing class) when several ranges contain the line. Score
-    is unused here and always 0.0; callers that need ranking should use
-    `search()` instead.
+    context-gathering (map a conflicted hunk's line range to a symbol.
     """
     conn = _get_connection()
     row = conn.execute(

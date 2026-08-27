@@ -1,6 +1,5 @@
 """
 Deterministic node: extracts and filters git diff.
-No LLM involved — pure git + heuristics, per README's diff intelligence layer.
 """
 import subprocess
 from pathlib import Path
@@ -9,10 +8,13 @@ import pathspec
 
 from gitscribe.core.state import GitScribeState
 
+# fallback patterns used only if no .gitignore exists / repo has none of these listed
 DEFAULT_IGNORE_PATTERNS = ["*.lock", "package-lock.json", "*.min.js", "poetry.lock"]
+
+
 class GitCommandError(RuntimeError):
     """Raised when a required git command fails — no origin/main, shallow
-    clone, detached HEAD with no upstream, fork PR, etc.
+    clone, detached HEAD with no upstream, fork PR, etc. 
     """
 
 
@@ -33,7 +35,8 @@ def load_ignore_spec(repo_root: str = ".", extra_patterns: list[str] | None = No
 
 def _run_git(args: list[str], cwd: str | Path | None = None) -> str:
     """`cwd` lets callers run git against a different working tree (e.g. a
-    disposable merge-preview worktree).
+    disposable merge-preview worktree) without a second git-wrapper existing
+    elsewhere in the codebase. 
     """
     result = subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd)
     if result.returncode != 0:

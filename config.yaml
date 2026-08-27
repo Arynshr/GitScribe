@@ -12,12 +12,16 @@ retrieval:
 
 risk_classifier:
   enabled: true
-  # if a diff scores below this, skip LLM generation entirely (template fallback)
   trivial_threshold: 0.15
 
 failure_handling:
   max_retries: 2
   retry_backoff_seconds: 2
+
+merge_preview:
+  escalate_below_confidence: high  
+  blast_radius_depth: 2
+  worktree_cleanup: true      
 
 hooks:
   pre_push:
