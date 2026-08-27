@@ -1,5 +1,4 @@
 """
-core/merge_preview/preview.py
 Public entry point for the merge-preview feature. Wires together
 worktree, hunk_parser, context, and resolver
 """
@@ -16,7 +15,7 @@ from gitscribe.core.merge_preview.worktree import WorktreeError, attempt_merge, 
 
 logger = logging.getLogger("gitscribe.merge_preview")
 
-__all__ = ["WorktreeError", "MergePreviewReport", "FileReport", "run_merge_preview"]
+__all__ = ["FileReport", "MergePreviewReport", "WorktreeError", "run_merge_preview"]
 
 
 def run_merge_preview(

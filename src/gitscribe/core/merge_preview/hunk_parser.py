@@ -16,7 +16,7 @@ from gitscribe.core.merge_preview.worktree import merge_base, read_blob
 logger = logging.getLogger("gitscribe.merge_preview")
 
 _OURS_RE = re.compile(r"^<<<<<<< (.*)$")
-_BASE_RE = re.compile(r"^\|\|\|\|\|\|\| ?(.*)$") 
+_BASE_RE = re.compile(r"^\|\|\|\|\|\|\| ?(.*)$")
 _SEP_RE = re.compile(r"^=======$")
 _THEIRS_RE = re.compile(r"^>>>>>>> (.*)$")
 
