@@ -121,3 +121,73 @@ def test_schema_cascade_delete(temp_index_db):
     remaining = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
     conn.close()
     assert remaining == 0
+
+
+def test_symbol_at_finds_enclosing_symbol(temp_index_db):
+    conn = index_store._get_connection()
+    conn.execute(
+        "INSERT INTO symbols (id, name, kind, file, lineno, end_lineno) "
+        "VALUES (1, 'foo', 'function', 'a.py', 10, 20)"
+    )
+    conn.commit()
+    conn.close()
+
+    result = index_store.symbol_at("a.py", 15)
+    assert result is not None
+    assert result.name == "foo"
+    assert result.symbol_id == 1
+
+
+def test_symbol_at_prefers_innermost_symbol(temp_index_db):
+    """A method inside a class: both ranges contain the line, but the
+    method (smaller range) should win over the enclosing class.
+    """
+    conn = index_store._get_connection()
+    conn.execute(
+        "INSERT INTO symbols (id, name, kind, file, lineno, end_lineno) "
+        "VALUES (1, 'MyClass', 'class', 'a.py', 1, 50)"
+    )
+    conn.execute(
+        "INSERT INTO symbols (id, name, kind, file, lineno, end_lineno) "
+        "VALUES (2, 'my_method', 'method', 'a.py', 10, 15)"
+    )
+    conn.commit()
+    conn.close()
+
+    result = index_store.symbol_at("a.py", 12)
+    assert result.name == "my_method"
+
+
+def test_symbol_at_returns_none_when_no_match(temp_index_db):
+    assert index_store.symbol_at("nonexistent.py", 5) is None
+
+
+def test_symbol_at_returns_none_for_line_outside_any_range(temp_index_db):
+    conn = index_store._get_connection()
+    conn.execute(
+        "INSERT INTO symbols (id, name, kind, file, lineno, end_lineno) "
+        "VALUES (1, 'foo', 'function', 'a.py', 10, 20)"
+    )
+    conn.commit()
+    conn.close()
+
+    assert index_store.symbol_at("a.py", 5) is None
+    assert index_store.symbol_at("a.py", 25) is None
+
+
+def test_symbol_at_handles_null_end_lineno(temp_index_db):
+    """Some parsed symbols may lack end_lineno (parser edge case) — the
+    query treats NULL end_lineno as an unbounded (matches anything at or
+    after lineno) range rather than crashing or always excluding it.
+    """
+    conn = index_store._get_connection()
+    conn.execute(
+        "INSERT INTO symbols (id, name, kind, file, lineno, end_lineno) "
+        "VALUES (1, 'foo', 'function', 'a.py', 10, NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    result = index_store.symbol_at("a.py", 100)
+    assert result is not None
+    assert result.name == "foo"
