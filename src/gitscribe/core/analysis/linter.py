@@ -7,6 +7,7 @@ symbol-scoped findings so risk_classifier and CLI output share one shape.
 
 from __future__ import annotations
 
+import os
 import json
 import subprocess
 
@@ -17,12 +18,12 @@ from gitscribe.core.indexer.index_store import _get_connection
 class LintFinding(BaseModel):
     file: str
     lineno: int
-    code: str  # ruff rule code, e.g. "F401"
+    code: str
     message: str
-    severity: str  # "error" | "warning" -- derived from ruff code prefix
+    severity: str 
 
 
-_ERROR_PREFIXES = ("F", "E9", "S")  # pyflakes/syntax/security -> treated as errors
+_ERROR_PREFIXES = ("F", "E9", "S") 
 
 
 def _severity_for(code: str) -> str:
@@ -86,7 +87,8 @@ def severity_score(findings: list[LintFinding]) -> float:
 
 def _symbol_id_for(conn, file: str, lineno: int) -> int | None:
     """Line-range containment lookup — smallest enclosing symbol wins
-    (e.g. a method inside a class), so ORDER BY range size ascending."""
+    (e.g. a method inside a class)"""
+    file = _normalize_path(file)
     row = conn.execute(
         """SELECT id FROM symbols
            WHERE file = ? AND lineno <= ?
@@ -96,7 +98,7 @@ def _symbol_id_for(conn, file: str, lineno: int) -> int | None:
         (file, lineno, lineno),
     ).fetchone()
     return row["id"] if row else None
- 
+
  
 def write_lint_findings(findings: list[LintFinding]) -> int:
     """Maps each finding to a symbol_id (NULL for module-level findings
@@ -115,10 +117,18 @@ def write_lint_findings(findings: list[LintFinding]) -> int:
     conn.commit()
     return len(findings)
  
- 
 def run_lint_review(repo_root: str = ".") -> int:
-    """Entry point for `gitscribe review --lint-only` (spec §3.6/§3.7):
+    """Entry point for `gitscribe review --lint-only`:
     deterministic, no LLM call, runs regardless of Merkle skip state.
     """
     findings = run_ruff(repo_root)
     return write_lint_findings(findings)
+
+def _normalize_path(file: str) -> str:
+    """ruff --output-format=json reports absolute paths; symbols.file is
+    stored relative to repo root Without normalizing, the
+    containment lookup below silently never matches"""
+    try:
+        return os.path.relpath(file)
+    except ValueError:
+        return file

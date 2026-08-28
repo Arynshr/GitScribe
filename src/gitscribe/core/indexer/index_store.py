@@ -10,6 +10,7 @@ import time
 import sqlite3
 from pathlib import Path
 from typing import Literal
+from types import SimpleNamespace
 
 from gitscribe.core.indexer import merkle
 from pydantic import BaseModel
@@ -22,7 +23,7 @@ from gitscribe.core.indexer.embedder import (
 )
 from gitscribe.core.indexer.merkle import IndexRunResult
 from gitscribe.core.indexer.graph_builder import Edge, build_edges, SymbolResolver
-from gitscribe.core.indexer.parser import Symbol, parse_repo, discover_python_files
+from gitscribe.core.indexer.parser import Symbol, parse_file, discover_python_files
 
 INDEX_DB_PATH = Path.cwd() / "Storage" / "gitscribe_index.db"
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
@@ -246,15 +247,11 @@ def needs_reindex(repo_root: str = ".") -> bool:
     current = merkle.compute_leaf_hashes(files)
     root_hash = merkle.compute_root_hash(current)
     return merkle.get_last_root_hash(conn) != root_hash
+
  
  
 def _delete_symbols_for_files(conn, paths: set[str]) -> None:
     """Remove symbol rows for the given files.
- 
-    Before deleting, null out target_id on inbound edges from OTHER
-    (untouched) files so they survive as unresolved placeholders instead
-    of being cascade-deleted — this is the stale-edge case the spec calls
-    out as the most likely source of bugs (§2.4 step 6).
     """
     if not paths:
         return
@@ -276,13 +273,17 @@ def _delete_symbols_for_files(conn, paths: set[str]) -> None:
     )
     conn.execute(f"DELETE FROM symbols WHERE id IN ({id_placeholders})", ids)
     conn.commit()
- 
+
+def _symbol_like(row) -> SimpleNamespace:
+    """SymbolResolver expects attribute access"""
+    return SimpleNamespace(name=row["name"], file=row["file"], kind=row["kind"])
+
  
 def _reresolve_unresolved_edges(conn) -> None:
     """Re-run name resolution for edges left unresolved by file changes,
     now that touched files' symbols have fresh ids."""
     all_symbols = conn.execute("SELECT id, name, kind, file, parent FROM symbols").fetchall()
-    resolver = SymbolResolver([(r["id"], r) for r in all_symbols])  # duck-typed Symbol-like rows
+    resolver = SymbolResolver([(r["id"], _symbol_like(r)) for r in all_symbols])
     unresolved = conn.execute(
         "SELECT id, target_name, source_id FROM edges WHERE resolved = 0"
     ).fetchall()
@@ -299,6 +300,7 @@ def _reresolve_unresolved_edges(conn) -> None:
                 (target_id, edge["id"]),
             )
     conn.commit()
+
  
  
 def reindex(repo_root: str, cfg: dict, force: bool = False) -> IndexRunResult:
@@ -339,10 +341,16 @@ def reindex(repo_root: str, cfg: dict, force: bool = False) -> IndexRunResult:
         # up-to-date symbol table (not just the touched-file subset), so
         # calls into untouched files still resolve.
         all_symbols = conn.execute("SELECT id, name, kind, file, parent FROM symbols").fetchall()
-        resolver = SymbolResolver([(r["id"], r) for r in all_symbols])
+        resolver = SymbolResolver([(r["id"], _symbol_like(r)) for r in all_symbols])
+        # source file per new symbol id, so each edge resolves against the
+        # *caller's* file — build_edges()'s own resolution is scoped only
+        # to new_symbols_with_ids (this run's touched files) and would miss
+        # calls into untouched files, so it's not used here.
+        file_by_sid = {sid: sym.file for sid, sym in new_symbols_with_ids}
         edges = build_edges(new_symbols_with_ids)
         for e in edges:
-            target_id = resolver.resolve(e.target_name, e.source_file) if hasattr(e, "source_file") else e.target_id
+            source_file = file_by_sid.get(e.source_id, "")
+            target_id = resolver.resolve(e.target_name, source_file)
             conn.execute(
                 """INSERT INTO edges (source_id, target_id, target_name, edge_type, resolved)
                    VALUES (?, ?, ?, ?, ?)""",
@@ -371,3 +379,4 @@ def reindex(repo_root: str, cfg: dict, force: bool = False) -> IndexRunResult:
         files_skipped=len(files) - len(diff.touched),
         duration_s=time.perf_counter() - start,
     )
+
