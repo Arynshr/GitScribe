@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from gitscribe import console
 from gitscribe.core import hooks as hook_utils, memory
 from gitscribe.core.analysis import linter as linter_mod
-from gitscribe.core.analysis.diff_symbols import changed_symbol_ids
+from gitscribe.core.analysis.diff_symbols import changed_symbol_ids, split_diff_by_file
 from gitscribe.core.analysis.rag import (
     answer_query,
     retrieve,
@@ -430,13 +430,20 @@ def review_cmd(
             raw_diff = ""
 
         if raw_diff.strip():
-            symbol_ids = changed_symbol_ids(raw_diff)
-            try:
-                agentic_findings = run_agentic_review(raw_diff, symbol_ids, config)
-                anchor = symbol_ids[0] if symbol_ids else None
-                agentic_count = write_agentic_findings(agentic_findings, anchor)
-            except Exception as e:
-                console.warn(f"agentic review failed: {e}")
+            # One bounded LLM call per file, not one call for the whole
+            # branch diff — sending the entire multi-file diff as a
+            # single prompt is what caused a 413 (40k tokens vs an 8k
+            # TPM limit) in practice. Per-file also means one bad/huge
+            # file doesn't sink the whole review.
+            per_file_diffs = split_diff_by_file(raw_diff)
+            for file, file_diff in per_file_diffs.items():
+                symbol_ids = changed_symbol_ids(file_diff)
+                try:
+                    findings = run_agentic_review(file_diff, symbol_ids, config)
+                    anchor = symbol_ids[0] if symbol_ids else None
+                    agentic_count += write_agentic_findings(findings, anchor)
+                except Exception as e:
+                    console.warn(f"agentic review failed on {file}: {e}")
         else:
             console.info("empty diff, skipping agentic review (index staleness is a separate condition)")
 
@@ -685,7 +692,10 @@ def merge_preview_cmd(
 ):
     """Speculatively merge `branch` into `base` inside a disposable worktree
     and, if it conflicts, propose a resolution per hunk grounded in blast
-    radius and each branch's recovered PR intent.
+    radius and each branch's recovered PR intent. Never touches your real
+    working tree, index, or branches — nothing here is auto-applied.
+
+    Also available as `git merge-preview <branch>` after `gitscribe init`.
     """
     cfg = load_config()
     require_api_key()
@@ -732,37 +742,6 @@ def merge_preview_cmd(
         "Nothing has been applied — this is a preview. Run the real merge "
         "yourself once you've reviewed it."
     )
-
-@app.command()
-def index(force: bool = typer.Option(False, "--force", help="Bypass hash check, full rebuild")):
-    config = load_config()
-    result = index_store.reindex(".", config, force=force)
-    if result.skipped_entirely:
-        console.info("index unchanged, nothing to do")
-    else:
-        console.success(f"indexed: {result.files_changed} changed, {result.files_skipped} skipped")
-
-
-@app.command(name="review")
-def review_cmd(
-    lint_only: bool = typer.Option(False, "--lint-only", help="Static pass only, no LLM cost"),
-    as_json: bool = typer.Option(False, "--json", help="Scriptable output"),
-):
-    """Run lint + agentic review, write review_findings, print summary."""
-    config = load_config()
-    lint_count = 0
-    if config.get("review", {}).get("lint", {}).get("enabled", True):
-        lint_count = linter_mod.run_lint_review(".")
-
-    agentic_count = 0
-    if not lint_only and config.get("review", {}).get("agentic", {}).get("enabled", True):
-        console.warn("agentic review needs a diff + changed-symbol-id list wired in from diff_parser")
-
-    if as_json:
-        typer.echo(json.dumps({"lint_findings": lint_count, "agentic_findings": agentic_count}))
-    else:
-        console.success(f"review: {lint_count} lint finding(s), {agentic_count} agentic finding(s)")
-
 
 
 if __name__ == "__main__":

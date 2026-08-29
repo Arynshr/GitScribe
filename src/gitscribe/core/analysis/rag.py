@@ -6,16 +6,12 @@ context.
 
 from __future__ import annotations
 
-from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
+from langchain_core.output_parsers import PydanticOutputParser
 
 from gitscribe.core.failure_router import classify_failure
 from gitscribe.core.indexer.index_store import SearchResult, _get_connection, blast_radius, search
 
-_TOKENS_PER_CHAR = 0.25
-
-def _estimate_tokens(text: str) -> int:
-    return int(len(text) * _TOKENS_PER_CHAR)
 
 class ContextSnippet(BaseModel):
     symbol_id: int
@@ -23,6 +19,7 @@ class ContextSnippet(BaseModel):
     file: str
     lineno: int
     relation: str
+
 
 class RAGContext(BaseModel):
     query: str
@@ -36,39 +33,6 @@ class RAGContext(BaseModel):
         for s in self.snippets:
             lines.append(f"- [{s.relation}] {s.name} ({s.file}:{s.lineno})")
         return "\n".join(lines)
-
-class ReviewFindingLLM(BaseModel):
-    severity: str = Field(description="one of: info, warning, error")
-    rule_or_reason: str = Field(description="short label for what triggered this finding")
-    message: str = Field(description="the finding itself, specific and actionable")
-    line_start: int | None = None
-    line_end: int | None = None
-
-
-class ReviewFindingsLLM(BaseModel):
-    findings: list[ReviewFindingLLM] = Field(default_factory=list)
-
-
-_REVIEW_PARSER = PydanticOutputParser(pydantic_object=ReviewFindingsLLM)
-
-_REVIEW_PROMPT = """You are reviewing a code change for correctness, risk, and \
-maintainability issues a linter would miss.
-
-Diff hunk (never omit or summarize — review this exactly as given):
-{diff_hunk}
-
-Direct callers of the changed code:
-{callers_block}
-
-Direct callees of the changed code:
-{callees_block}
-
-Same-file siblings (may be omitted below due to context budget):
-{siblings_block}
-
-Respond with findings only where you have a concrete, specific concern.
-{format_instructions}
-"""
 
 
 def retrieve(query: str, cfg: dict, top_k: int = 5, expand_depth: int = 1) -> RAGContext:
@@ -113,7 +77,7 @@ _SYNTHESIS_PROMPT = (
 
 def answer_query(query: str, context: RAGContext, cfg: dict):
     """Synthesizes a natural-language answer to `query`, grounded in the
-    already-retrieved `context`, via `llm_client.build_chat_model()`
+    already-retrieved `context`
     """
     from gitscribe.core.llm_client import build_chat_model
 
@@ -124,11 +88,55 @@ def answer_query(query: str, context: RAGContext, cfg: dict):
     response = model.invoke(prompt)
     return response.content
 
+# Agentic review pass
+ 
+_TOKENS_PER_CHAR = 0.25  # rough estimate; good enough for a hard budget cap
+
+
+def _estimate_tokens(text: str) -> int:
+    return int(len(text) * _TOKENS_PER_CHAR)
+
+
+class ReviewFindingLLM(BaseModel):
+    severity: str = Field(description="one of: info, warning, error")
+    rule_or_reason: str = Field(description="short label for what triggered this finding")
+    message: str = Field(description="the finding itself, specific and actionable")
+    line_start: int | None = None
+    line_end: int | None = None
+
+
+class ReviewFindingsLLM(BaseModel):
+    findings: list[ReviewFindingLLM] = Field(default_factory=list)
+
+
+_REVIEW_PARSER = PydanticOutputParser(pydantic_object=ReviewFindingsLLM)
+
+_REVIEW_PROMPT = """You are reviewing a code change for correctness, risk, and \
+maintainability issues a linter would miss.
+
+Diff hunk (never omit or summarize — review this exactly as given):
+{diff_hunk}
+
+Direct callers of the changed code:
+{callers_block}
+
+Direct callees of the changed code:
+{callees_block}
+
+Same-file siblings (may be omitted below due to context budget):
+{siblings_block}
+
+Respond with findings only where you have a concrete, specific concern.
+{format_instructions}
+"""
+
+
 def _assemble_review_context(
     diff_hunk: str, changed_symbol_ids: list[int], hops: int, max_context_tokens: int
 ) -> dict[str, str]:
     """Fixed assembly order (spec §3.3): diff hunk (never truncated) ->
-    callers -> callees -> siblings."""
+    callers -> callees -> siblings, dropped in that reverse priority when
+    over budget."""
     callers: list[str] = []
     callees: list[str] = []
     siblings: list[str] = []
@@ -174,13 +182,19 @@ def run_agentic_review(
     cfg: dict,
 ) -> list[ReviewFindingLLM]:
     """Runs the agentic review pass. Retries are routed through
-    failure_router.classify_failure"""
+    failure_router.classify_failure instead of a second failure path.
+    """
     from gitscribe.core.llm_client import build_chat_model
 
     review_cfg = cfg.get("review", {}).get("agentic", {})
     hops = review_cfg.get("hops", 2)
     max_context_tokens = review_cfg.get("max_context_tokens", 6000)
     max_retries = cfg.get("failure_handling", {}).get("max_retries", 2)
+
+    diff_budget = int(max_context_tokens * 0.6)  # leave room for context + prompt scaffolding
+    if _estimate_tokens(diff_hunk) > diff_budget:
+        max_chars = int(diff_budget / _TOKENS_PER_CHAR)
+        diff_hunk = diff_hunk[:max_chars] + "\n[... diff truncated, exceeded per-call token budget ...]"
 
     context = _assemble_review_context(diff_hunk, changed_symbol_ids, hops, max_context_tokens)
     prompt = _REVIEW_PROMPT.format(
@@ -197,7 +211,7 @@ def run_agentic_review(
             ai_msg = llm.invoke(prompt)
             parsed: ReviewFindingsLLM = _REVIEW_PARSER.invoke(ai_msg.content)
             return parsed.findings
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — classify via failure_router, don't swallow silently
             last_error = exc
             failure_type = classify_failure(str(exc))
             if failure_type == "bad_output" or attempt == max_retries:

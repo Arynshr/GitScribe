@@ -11,8 +11,7 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
 from gitscribe.core.analysis.diff_symbols import changed_symbol_ids
-from gitscribe.core.indexer.index_store import blast_radius
-from gitscribe.core.indexer.index_store import _get_connection as _index_conn
+from gitscribe.core.indexer.index_store import _get_connection as _index_conn, blast_radius
 from gitscribe.core.llm_client import build_chat_model
 from gitscribe.core.state import GitScribeState
 
