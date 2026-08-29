@@ -96,7 +96,6 @@ def test_symbol_id_for_normalizes_absolute_ruff_paths(tmp_path, monkeypatch):
     but symbols.file is stored relative to repo root. Without
     normalization, every finding maps to symbol_id=NULL.
     """
-    import os
     import sqlite3
     from pathlib import Path
 
