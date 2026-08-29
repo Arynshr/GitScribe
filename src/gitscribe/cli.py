@@ -15,7 +15,13 @@ from pydantic import ValidationError
 from gitscribe import console
 from gitscribe.core import hooks as hook_utils, memory
 from gitscribe.core.analysis import linter as linter_mod
-from gitscribe.core.analysis.rag import answer_query, retrieve
+from gitscribe.core.analysis.diff_symbols import changed_symbol_ids
+from gitscribe.core.analysis.rag import (
+    answer_query,
+    retrieve,
+    run_agentic_review,
+    write_agentic_findings,
+)
 from gitscribe.core.config_schema import GitScribeConfig
 from gitscribe.core.diff_parser import (
     GitCommandError,
@@ -366,13 +372,13 @@ def create_pr(
 def index(
     repo_root: str = typer.Option(".", help="Repo root to index"),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output"),
+    force: bool = typer.Option(False, "--force", help="Bypass hash check, full rebuild"),
 ):
-    """Build/refresh the code graph + embeddings. Full rebuild per run
-    (Stage 2 policy) — safe to re-run any time.
+    """Build/refresh the code graph + embeddings. Incremental by default
+    (Merkle hash skip/reuse) — pass --force for a full rebuild.
     """
     config = load_config()  # already a dict — see load_config() docstring
-    index_store.init_schema()
-    warning = index_store.rebuild_index(repo_root, config)
+    result = index_store.reindex(repo_root, config, force=force)
 
     conn = index_store._get_connection()
     symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
@@ -380,14 +386,64 @@ def index(
     resolved_count = conn.execute("SELECT COUNT(*) FROM edges WHERE resolved = 1").fetchone()[0]
     conn.close()
 
-    stats = {"symbols": symbol_count, "edges": edge_count, "resolved_edges": resolved_count}
+    stats = {
+        "symbols": symbol_count,
+        "edges": edge_count,
+        "resolved_edges": resolved_count,
+        "files_changed": result.files_changed,
+        "files_skipped": result.files_skipped,
+        "skipped_entirely": result.skipped_entirely,
+    }
 
     if json_output:
-        typer.echo(json.dumps({**stats, "warning": warning}, indent=2))
+        typer.echo(json.dumps(stats, indent=2))
+    elif result.skipped_entirely:
+        console.info("index unchanged since last run, nothing to do")
     else:
-        console.success(f"indexed {symbol_count} symbols, {edge_count} edges ({resolved_count} resolved)")
-        if warning:
-            console.warn(warning)
+        console.success(
+            f"indexed {symbol_count} symbols, {edge_count} edges ({resolved_count} resolved) "
+            f"— {result.files_changed} file(s) reprocessed, {result.files_skipped} skipped"
+        )
+
+
+@app.command(name="review")
+def review_cmd(
+    lint_only: bool = typer.Option(False, "--lint-only", help="Static pass only, no LLM cost"),
+    as_json: bool = typer.Option(False, "--json", help="Scriptable output"),
+    base: str = typer.Option("origin/main", help="Diff base for the agentic pass"),
+    head: str = typer.Option("HEAD", help="Diff head for the agentic pass"),
+):
+    """Run lint + agentic review, write review_findings, print summary."""
+    config = load_config()
+
+    lint_count = 0
+    if config.get("review", {}).get("lint", {}).get("enabled", True):
+        findings = linter_mod.run_ruff(".")
+        lint_count = linter_mod.write_lint_findings(findings)
+
+    agentic_count = 0
+    if not lint_only and config.get("review", {}).get("agentic", {}).get("enabled", True):
+        try:
+            raw_diff = get_raw_diff(base=base, head=head)
+        except GitCommandError as e:
+            console.warn(f"skipping agentic review, couldn't get diff: {e}")
+            raw_diff = ""
+
+        if raw_diff.strip():
+            symbol_ids = changed_symbol_ids(raw_diff)
+            try:
+                agentic_findings = run_agentic_review(raw_diff, symbol_ids, config)
+                anchor = symbol_ids[0] if symbol_ids else None
+                agentic_count = write_agentic_findings(agentic_findings, anchor)
+            except Exception as e:
+                console.warn(f"agentic review failed: {e}")
+        else:
+            console.info("empty diff, skipping agentic review (index staleness is a separate condition)")
+
+    if as_json:
+        typer.echo(json.dumps({"lint_findings": lint_count, "agentic_findings": agentic_count}))
+    else:
+        console.success(f"review: {lint_count} lint finding(s), {agentic_count} agentic finding(s)")
 
 
 @app.command()
@@ -629,10 +685,7 @@ def merge_preview_cmd(
 ):
     """Speculatively merge `branch` into `base` inside a disposable worktree
     and, if it conflicts, propose a resolution per hunk grounded in blast
-    radius and each branch's recovered PR intent. Never touches your real
-    working tree, index, or branches — nothing here is auto-applied.
-
-    Also available as `git merge-preview <branch>` after `gitscribe init`.
+    radius and each branch's recovered PR intent.
     """
     cfg = load_config()
     require_api_key()
@@ -703,11 +756,6 @@ def review_cmd(
  
     agentic_count = 0
     if not lint_only and config.get("review", {}).get("agentic", {}).get("enabled", True):
-        # Agentic pass needs a non-empty diff to review (spec §3.7: skip
-        # on empty diff, not on "index unchanged" — these are different
-        # conditions). Diff/changed-symbol resolution wiring is left to
-        # the caller since diff_parser's current-branch diff helpers
-        # weren't re-derived here to avoid duplicating that logic.
         console.warn("agentic review needs a diff + changed-symbol-id list wired in from diff_parser")
  
     if as_json:

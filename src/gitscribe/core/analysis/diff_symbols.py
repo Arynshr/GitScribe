@@ -42,9 +42,9 @@ def changed_lines_by_file(diff_text: str) -> dict[str, list[int]]:
             result.setdefault(current_file, []).append(cursor)
             cursor += 1
         elif line.startswith("-"):
-            pass 
+            pass
         else:
-            cursor += 1  
+            cursor += 1
 
     return result
 

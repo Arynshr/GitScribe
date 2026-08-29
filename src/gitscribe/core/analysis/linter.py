@@ -7,23 +7,24 @@ symbol-scoped findings so risk_classifier and CLI output share one shape.
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import subprocess
 
 from pydantic import BaseModel
 
 from gitscribe.core.indexer.index_store import _get_connection
 
+
 class LintFinding(BaseModel):
     file: str
     lineno: int
     code: str
     message: str
-    severity: str 
+    severity: str
 
 
-_ERROR_PREFIXES = ("F", "E9", "S") 
+_ERROR_PREFIXES = ("F", "E9", "S")
 
 
 def _severity_for(code: str) -> str:
@@ -99,7 +100,7 @@ def _symbol_id_for(conn, file: str, lineno: int) -> int | None:
     ).fetchone()
     return row["id"] if row else None
 
- 
+
 def write_lint_findings(findings: list[LintFinding]) -> int:
     """Maps each finding to a symbol_id (NULL for module-level findings
     with no enclosing symbol, per spec §3.2) and writes to
@@ -116,7 +117,7 @@ def write_lint_findings(findings: list[LintFinding]) -> int:
         )
     conn.commit()
     return len(findings)
- 
+
 def run_lint_review(repo_root: str = ".") -> int:
     """Entry point for `gitscribe review --lint-only`:
     deterministic, no LLM call, runs regardless of Merkle skip state.

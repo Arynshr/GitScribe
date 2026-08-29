@@ -6,13 +6,13 @@ context.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
 from langchain_core.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field
 
 from gitscribe.core.failure_router import classify_failure
 from gitscribe.core.indexer.index_store import SearchResult, _get_connection, blast_radius, search
 
-_TOKENS_PER_CHAR = 0.25 
+_TOKENS_PER_CHAR = 0.25
 
 def _estimate_tokens(text: str) -> int:
     return int(len(text) * _TOKENS_PER_CHAR)
@@ -36,7 +36,7 @@ class RAGContext(BaseModel):
         for s in self.snippets:
             lines.append(f"- [{s.relation}] {s.name} ({s.file}:{s.lineno})")
         return "\n".join(lines)
-    
+
 class ReviewFindingLLM(BaseModel):
     severity: str = Field(description="one of: info, warning, error")
     rule_or_reason: str = Field(description="short label for what triggered this finding")
@@ -197,7 +197,7 @@ def run_agentic_review(
             ai_msg = llm.invoke(prompt)
             parsed: ReviewFindingsLLM = _REVIEW_PARSER.invoke(ai_msg.content)
             return parsed.findings
-        except Exception as exc: 
+        except Exception as exc:
             last_error = exc
             failure_type = classify_failure(str(exc))
             if failure_type == "bad_output" or attempt == max_retries:
