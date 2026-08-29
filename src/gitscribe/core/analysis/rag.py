@@ -1,9 +1,7 @@
 """
-core/analysis/rag.py
 Query -> embed -> vector search -> graph-expand -> assembled context.
 Replaces/augments today's branch-prefix PR retrieval with code-aware
-context. Public API from day one — Stage 4's `gitscribe query` CLI and
-generator.py both call this module directly.
+context.
 """
 
 from __future__ import annotations
@@ -12,13 +10,13 @@ from pydantic import BaseModel, Field
 from langchain_core.output_parsers import PydanticOutputParser
 
 from gitscribe.core.failure_router import classify_failure
-from gitscribe.core.indexer.index_store import SearchResult, blast_radius, search, _get_connection, symbol_at
-from gitscribe.core.llm_client import build_chat_model 
+from gitscribe.core.indexer.index_store import SearchResult, _get_connection, blast_radius, search
 
-_TOKENS_PER_CHAR = 0.25
+_TOKENS_PER_CHAR = 0.25 
 
 def _estimate_tokens(text: str) -> int:
     return int(len(text) * _TOKENS_PER_CHAR)
+
 class ContextSnippet(BaseModel):
     symbol_id: int
     name: str
@@ -45,30 +43,33 @@ class ReviewFindingLLM(BaseModel):
     message: str = Field(description="the finding itself, specific and actionable")
     line_start: int | None = None
     line_end: int | None = None
-    
+
+
 class ReviewFindingsLLM(BaseModel):
     findings: list[ReviewFindingLLM] = Field(default_factory=list)
 
-_PARSER = PydanticOutputParser(pydantic_object=ReviewFindingsLLM)
+
+_REVIEW_PARSER = PydanticOutputParser(pydantic_object=ReviewFindingsLLM)
 
 _REVIEW_PROMPT = """You are reviewing a code change for correctness, risk, and \
 maintainability issues a linter would miss.
- 
+
 Diff hunk (never omit or summarize — review this exactly as given):
 {diff_hunk}
- 
+
 Direct callers of the changed code:
 {callers_block}
- 
+
 Direct callees of the changed code:
 {callees_block}
- 
+
 Same-file siblings (may be omitted below due to context budget):
 {siblings_block}
- 
+
 Respond with findings only where you have a concrete, specific concern.
 {format_instructions}
 """
+
 
 def retrieve(query: str, cfg: dict, top_k: int = 5, expand_depth: int = 1) -> RAGContext:
     matches: list[SearchResult] = search(query, cfg, top_k=top_k)
@@ -113,11 +114,6 @@ _SYNTHESIS_PROMPT = (
 def answer_query(query: str, context: RAGContext, cfg: dict):
     """Synthesizes a natural-language answer to `query`, grounded in the
     already-retrieved `context`, via `llm_client.build_chat_model()`
-    (provider-agnostic, same BYOK pattern as the rest of the codebase).
-    Takes a pre-built `RAGContext` so callers can skip the LLM call when
-    there's nothing to ground an answer in. Raises whatever
-    `build_chat_model`/`model.invoke` raise — callers decide how to
-    surface or fall back.
     """
     from gitscribe.core.llm_client import build_chat_model
 
@@ -128,21 +124,20 @@ def answer_query(query: str, context: RAGContext, cfg: dict):
     response = model.invoke(prompt)
     return response.content
 
-def _assemble_context(
+def _assemble_review_context(
     diff_hunk: str, changed_symbol_ids: list[int], hops: int, max_context_tokens: int
 ) -> dict[str, str]:
     """Fixed assembly order (spec §3.3): diff hunk (never truncated) ->
-    callers -> callees -> siblings, dropped in that reverse priority when
-    over budget."""
+    callers -> callees -> siblings."""
     callers: list[str] = []
     callees: list[str] = []
     siblings: list[str] = []
- 
+
     for sid in changed_symbol_ids:
         for r in blast_radius(sid, max_depth=hops):
-            line = f"{r.direction} depth={r.depth} lineno={r.lineno}"
+            line = f"{r.name} ({r.file}:{r.lineno}, depth={r.depth})"
             (callers if r.direction == "caller" else callees).append(line)
- 
+
     conn = _get_connection()
     for sid in changed_symbol_ids:
         row = conn.execute("SELECT file FROM symbols WHERE id = ?", (sid,)).fetchone()
@@ -152,16 +147,15 @@ def _assemble_context(
             "SELECT name, lineno FROM symbols WHERE file = ? AND id != ?", (row["file"], sid)
         ).fetchall()
         siblings.extend(f"{r['name']} (line {r['lineno']})" for r in sib_rows)
- 
+
     budget = max_context_tokens - _estimate_tokens(diff_hunk)
     blocks = {"callers_block": "", "callees_block": "", "siblings_block": ""}
- 
+
     # Priority: callers, then callees, then siblings — truncate siblings first.
     for key, items in (("callers_block", callers), ("callees_block", callees), ("siblings_block", siblings)):
         text = "\n".join(items) or "(none)"
         cost = _estimate_tokens(text)
         if cost > budget:
-            # keep truncating from the tail until it fits, or drop entirely
             kept = items[:]
             while kept and _estimate_tokens("\n".join(kept)) > budget:
                 kept.pop()
@@ -170,35 +164,40 @@ def _assemble_context(
         else:
             budget -= cost
         blocks[key] = text
- 
+
     return blocks
+
 
 def run_agentic_review(
     diff_hunk: str,
     changed_symbol_ids: list[int],
     cfg: dict,
 ) -> list[ReviewFindingLLM]:
+    """Runs the agentic review pass. Retries are routed through
+    failure_router.classify_failure"""
+    from gitscribe.core.llm_client import build_chat_model
+
     review_cfg = cfg.get("review", {}).get("agentic", {})
     hops = review_cfg.get("hops", 2)
     max_context_tokens = review_cfg.get("max_context_tokens", 6000)
     max_retries = cfg.get("failure_handling", {}).get("max_retries", 2)
- 
-    context = _assemble_context(diff_hunk, changed_symbol_ids, hops, max_context_tokens)
+
+    context = _assemble_review_context(diff_hunk, changed_symbol_ids, hops, max_context_tokens)
     prompt = _REVIEW_PROMPT.format(
         diff_hunk=diff_hunk,
-        format_instructions=_PARSER.get_format_instructions(),
+        format_instructions=_REVIEW_PARSER.get_format_instructions(),
         **context,
     )
- 
+
     model_name = cfg["llm"]["model"]
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
             llm = build_chat_model(cfg, model_name, temperature=0.1)
             ai_msg = llm.invoke(prompt)
-            parsed: ReviewFindingsLLM = _PARSER.invoke(ai_msg.content)
+            parsed: ReviewFindingsLLM = _REVIEW_PARSER.invoke(ai_msg.content)
             return parsed.findings
-        except Exception as exc:  # noqa: BLE001 — classify via failure_router, don't swallow silently
+        except Exception as exc: 
             last_error = exc
             failure_type = classify_failure(str(exc))
             if failure_type == "bad_output" or attempt == max_retries:
@@ -206,8 +205,8 @@ def run_agentic_review(
     if last_error is not None:
         raise last_error
     return []
- 
- 
+
+
 def write_agentic_findings(findings: list[ReviewFindingLLM], symbol_id: int | None) -> int:
     conn = _get_connection()
     for f in findings:
@@ -219,4 +218,3 @@ def write_agentic_findings(findings: list[ReviewFindingLLM], symbol_id: int | No
         )
     conn.commit()
     return len(findings)
-

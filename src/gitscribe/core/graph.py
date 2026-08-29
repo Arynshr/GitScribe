@@ -23,7 +23,7 @@ from gitscribe.core.diff_parser import diff_parser_node
 from gitscribe.core.failure_router import failure_router_node, route_after_failure
 from gitscribe.core.generator import generator_node
 from gitscribe.core.retriever import retriever_node
-from gitscribe.core.risk_classifier import risk_classifier_node, route_after_risk
+from gitscribe.core.risk_classifier import risk_classifier_node_blended, route_after_risk
 from gitscribe.core.state import GitScribeState
 from gitscribe.core.summarizer import summarizer_node
 
@@ -67,7 +67,7 @@ def build_graph(cfg: dict):
 
     g.add_node("diff_parser", functools.partial(diff_parser_node, cfg=cfg))
     g.add_node("summarizer", summarizer_node)
-    g.add_node("risk_classifier", functools.partial(risk_classifier_node, cfg=cfg))
+    g.add_node("risk_classifier", functools.partial(risk_classifier_node_blended, cfg=cfg))
     g.add_node("retriever", functools.partial(retriever_node, cfg=cfg))
     g.add_node("generator", functools.partial(generator_node, cfg=cfg))
     g.add_node("failure_router", functools.partial(failure_router_node, cfg=cfg))

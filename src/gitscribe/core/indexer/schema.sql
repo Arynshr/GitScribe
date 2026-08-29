@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS embeddings (
   model TEXT NOT NULL
 );
 
--- Merkle incremental indexing (spec §2.3)
 CREATE TABLE IF NOT EXISTS file_hashes (
   path TEXT PRIMARY KEY,
   content_hash TEXT NOT NULL,
@@ -44,7 +43,6 @@ CREATE TABLE IF NOT EXISTS index_runs (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- Code review findings (spec §3.1) — both lint and agentic passes write here
 CREATE TABLE IF NOT EXISTS review_findings (
   id INTEGER PRIMARY KEY,
   symbol_id INTEGER,
@@ -55,7 +53,7 @@ CREATE TABLE IF NOT EXISTS review_findings (
   line_start INTEGER,
   line_end INTEGER,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (symbol_id) REFERENCES symbols(id)
+  FOREIGN KEY (symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_review_findings_symbol ON review_findings(symbol_id);
 CREATE INDEX IF NOT EXISTS idx_review_findings_source ON review_findings(source);
