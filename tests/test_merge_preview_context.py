@@ -1,7 +1,11 @@
 from unittest.mock import patch
 
 from gitscribe.core.indexer.index_store import BlastRadiusResult, SearchResult
-from gitscribe.core.merge_preview.context import _blast_radius_summary, _branch_intent, gather_context
+from gitscribe.core.merge_preview.context import (
+    _blast_radius_summary,
+    _branch_intent,
+    gather_context,
+)
 from gitscribe.core.merge_preview.models import ConflictHunk
 
 CFG = {"merge_preview": {"blast_radius_depth": 2}}
