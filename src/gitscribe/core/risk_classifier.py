@@ -1,12 +1,18 @@
 """
 Agentic node #1: semantic triviality/risk classification.
+
+risk_classifier_node is unchanged (still the pure-LLM node — keeping it
+as-is means graph.py's existing wiring, tests, and the standalone import
+all still work). risk_classifier_node_blended wraps it with the spec §3.5
+structural signal and is what build_graph should point at instead.
 """
 
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
 from gitscribe.core.analysis.diff_symbols import changed_symbol_ids
-from gitscribe.core.indexer.index_store import _get_connection as _index_conn, blast_radius
+from gitscribe.core.indexer.index_store import blast_radius
+from gitscribe.core.indexer.index_store import _get_connection as _index_conn
 from gitscribe.core.llm_client import build_chat_model
 from gitscribe.core.state import GitScribeState
 
@@ -89,8 +95,8 @@ def _structural_signal(symbol_ids: list[int]) -> tuple[float, str]:
 
 
 def risk_classifier_node_blended(state: GitScribeState, cfg: dict) -> dict:
-    """same output shape as risk_classifier_node (risk_score,
-    risk_reasoning, skip_generation)
+    """Structural data folds into risk_reasoning as text, no new state field. weight=0 reproduces
+    risk_classifier_node's behavior exactly.
     """
     base = risk_classifier_node(state, cfg)
     weight = cfg.get("risk_classifier", {}).get("structural_weight", 0.0)
@@ -98,6 +104,15 @@ def risk_classifier_node_blended(state: GitScribeState, cfg: dict) -> dict:
         return base
 
     symbol_ids = changed_symbol_ids(state.raw_diff)
+    if not symbol_ids:
+        return {
+            **base,
+            "risk_reasoning": f"{base.get('risk_reasoning', '')}\n"
+            f"[structural] unavailable (no changed symbols resolved — "
+            f"run `gitscribe index` or check the diff maps to indexed code); "
+            f"using LLM score unblended",
+        }
+
     structural_score, structural_reasoning = _structural_signal(symbol_ids)
 
     llm_score = base["risk_score"]

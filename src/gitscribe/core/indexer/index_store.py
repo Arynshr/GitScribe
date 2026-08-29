@@ -174,7 +174,9 @@ def needs_reindex(repo_root: str = ".") -> bool:
     files = discover_python_files(repo_root)
     current = merkle.compute_leaf_hashes(files)
     root_hash = merkle.compute_root_hash(current)
-    return merkle.get_last_root_hash(conn) != root_hash
+    result = merkle.get_last_root_hash(conn) != root_hash
+    conn.close()
+    return result
 
 
 def _delete_symbols_for_files(conn, paths: set[str]) -> None:
@@ -204,18 +206,20 @@ def _symbol_like(row) -> SimpleNamespace:
 
 
 def _reresolve_unresolved_edges(conn) -> None:
+    """Re-run name resolution for edges left unresolved by file changes,
+    now that touched files' symbols have fresh ids."""
     all_symbols = conn.execute("SELECT id, name, kind, file, parent FROM symbols").fetchall()
     resolver = SymbolResolver([(r["id"], _symbol_like(r)) for r in all_symbols])
+    file_by_id = {r["id"]: r["file"] for r in all_symbols}  # avoid one query per edge below
+
     unresolved = conn.execute(
         "SELECT id, target_name, source_id FROM edges WHERE resolved = 0"
     ).fetchall()
     for edge in unresolved:
-        source_file = conn.execute(
-            "SELECT file FROM symbols WHERE id = ?", (edge["source_id"],)
-        ).fetchone()
+        source_file = file_by_id.get(edge["source_id"])
         if source_file is None:
             continue
-        target_id = resolver.resolve(edge["target_name"], source_file["file"])
+        target_id = resolver.resolve(edge["target_name"], source_file)
         if target_id is not None:
             conn.execute(
                 "UPDATE edges SET target_id = ?, resolved = 1 WHERE id = ?",
@@ -235,6 +239,7 @@ def reindex(repo_root: str, cfg: dict, force: bool = False) -> IndexRunResult:
     root_hash = merkle.compute_root_hash(current)
 
     if not force and merkle.get_last_root_hash(conn) == root_hash:
+        conn.close()
         return IndexRunResult(files_changed=0, files_skipped=len(files), duration_s=0.0, skipped_entirely=True)
 
     diff = merkle.diff_against_stored(conn, current)
@@ -283,6 +288,7 @@ def reindex(repo_root: str, cfg: dict, force: bool = False) -> IndexRunResult:
     _reresolve_unresolved_edges(conn)
     merkle.sync_file_hashes(conn, diff, current)
     merkle.record_run(conn, root_hash, files_changed=len(diff.touched), files_skipped=len(files) - len(diff.touched))
+    conn.close()
 
     return IndexRunResult(
         files_changed=len(diff.touched),

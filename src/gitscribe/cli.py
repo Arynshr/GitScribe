@@ -742,7 +742,7 @@ def index(force: bool = typer.Option(False, "--force", help="Bypass hash check, 
     else:
         console.success(f"indexed: {result.files_changed} changed, {result.files_skipped} skipped")
 
-    
+
 @app.command(name="review")
 def review_cmd(
     lint_only: bool = typer.Option(False, "--lint-only", help="Static pass only, no LLM cost"),
@@ -753,11 +753,11 @@ def review_cmd(
     lint_count = 0
     if config.get("review", {}).get("lint", {}).get("enabled", True):
         lint_count = linter_mod.run_lint_review(".")
- 
+
     agentic_count = 0
     if not lint_only and config.get("review", {}).get("agentic", {}).get("enabled", True):
         console.warn("agentic review needs a diff + changed-symbol-id list wired in from diff_parser")
- 
+
     if as_json:
         typer.echo(json.dumps({"lint_findings": lint_count, "agentic_findings": agentic_count}))
     else:
