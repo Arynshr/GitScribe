@@ -21,9 +21,6 @@ class RetrievalConfig(BaseModel):
 class RiskClassifierConfig(BaseModel):
     enabled: bool = True
     trivial_threshold: float = Field(ge=0.0, le=1.0, default=0.15)
-    # spec §3.5 — weight given to structural signal (lint errors + blast
-    # radius) vs the existing LLM risk score when blending. 0 preserves
-    # today's LLM-only behavior exactly.
     structural_weight: float = Field(ge=0.0, le=1.0, default=0.3)
 
 
@@ -51,6 +48,19 @@ class AgenticReviewConfig(BaseModel):
     enabled: bool = True
     max_context_tokens: int = Field(gt=0, default=6000)
     hops: int = Field(gt=0, default=2)
+    min_blast_radius_for_review: int | None = Field(
+        default=None,
+        description="Optional secondary gate: also escalate a file to the "
+        "agentic pass if its max blast radius meets/exceeds this, even "
+        "with no lint error findings. Off by default — a fixed threshold "
+        "doesn't generalize across repos of different size/connectivity "
+        "(e.g. one real repo measured had a MEDIAN blast radius of 5 "
+        "across all functions, so a naive default of 5 gated nothing). "
+        "If you enable this, measure your own repo's blast-radius "
+        "distribution first and set it well above the median/p90, not a "
+        "guessed number. Lint error findings remain the primary, "
+        "repo-agnostic gate regardless of this setting.",
+    )
 
 
 class ReviewConfig(BaseModel):

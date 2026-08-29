@@ -15,12 +15,12 @@ from pydantic import ValidationError
 from gitscribe import console
 from gitscribe.core import hooks as hook_utils, memory
 from gitscribe.core.analysis import linter as linter_mod
-from gitscribe.core.analysis.diff_symbols import changed_symbol_ids, split_diff_by_file
+from gitscribe.core.analysis.diff_symbols import split_diff_by_file
 from gitscribe.core.analysis.rag import (
     answer_query,
     retrieve,
-    run_agentic_review,
-    write_agentic_findings,
+    run_batched_agentic_review,
+    write_agentic_findings_by_file,
 )
 from gitscribe.core.config_schema import GitScribeConfig
 from gitscribe.core.diff_parser import (
@@ -430,20 +430,22 @@ def review_cmd(
             raw_diff = ""
 
         if raw_diff.strip():
-            # One bounded LLM call per file, not one call for the whole
-            # branch diff — sending the entire multi-file diff as a
-            # single prompt is what caused a 413 (40k tokens vs an 8k
-            # TPM limit) in practice. Per-file also means one bad/huge
-            # file doesn't sink the whole review.
+            # Gate + batch: files with no error-severity lint findings and
+            # low blast radius are skipped entirely (lint's bandit-style
+            # rules already caught anything dangerous on the current
+            # tree); everything else is packed into as few LLM calls as
+            # fit the token budget instead of one call per file.
             per_file_diffs = split_diff_by_file(raw_diff)
-            for file, file_diff in per_file_diffs.items():
-                symbol_ids = changed_symbol_ids(file_diff)
-                try:
-                    findings = run_agentic_review(file_diff, symbol_ids, config)
-                    anchor = symbol_ids[0] if symbol_ids else None
-                    agentic_count += write_agentic_findings(findings, anchor)
-                except Exception as e:
-                    console.warn(f"agentic review failed on {file}: {e}")
+            try:
+                results, anchors, reviewed_files = run_batched_agentic_review(per_file_diffs, config)
+                agentic_count = write_agentic_findings_by_file(results, anchors)
+                skipped = len(per_file_diffs) - len(reviewed_files)
+                console.info(
+                    f"agentic review: {len(reviewed_files)} file(s) sent to LLM, "
+                    f"{skipped} skipped by gate, {agentic_count} finding(s)"
+                )
+            except Exception as e:
+                console.warn(f"agentic review failed: {e}")
         else:
             console.info("empty diff, skipping agentic review (index staleness is a separate condition)")
 

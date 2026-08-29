@@ -1,13 +1,17 @@
 """
+core/analysis/rag.py
 Query -> embed -> vector search -> graph-expand -> assembled context.
 Replaces/augments today's branch-prefix PR retrieval with code-aware
-context.
+context. Public API from day one — Stage 4's `gitscribe query` CLI and
+generator.py both call this module directly.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
 from langchain_core.output_parsers import PydanticOutputParser
+
+from gitscribe.core.analysis.diff_symbols import changed_symbol_ids
 
 from gitscribe.core.failure_router import classify_failure
 from gitscribe.core.indexer.index_store import SearchResult, _get_connection, blast_radius, search
@@ -77,7 +81,12 @@ _SYNTHESIS_PROMPT = (
 
 def answer_query(query: str, context: RAGContext, cfg: dict):
     """Synthesizes a natural-language answer to `query`, grounded in the
-    already-retrieved `context`
+    already-retrieved `context`, via `llm_client.build_chat_model()`
+    (provider-agnostic, same BYOK pattern as the rest of the codebase).
+    Takes a pre-built `RAGContext` so callers can skip the LLM call when
+    there's nothing to ground an answer in. Raises whatever
+    `build_chat_model`/`model.invoke` raise — callers decide how to
+    surface or fall back.
     """
     from gitscribe.core.llm_client import build_chat_model
 
@@ -88,8 +97,11 @@ def answer_query(query: str, context: RAGContext, cfg: dict):
     response = model.invoke(prompt)
     return response.content
 
-# Agentic review pass
- 
+
+# ---------------------------------------------------------------------------
+# Agentic review pass (spec §3.3)
+# ---------------------------------------------------------------------------
+
 _TOKENS_PER_CHAR = 0.25  # rough estimate; good enough for a hard budget cap
 
 
@@ -182,7 +194,16 @@ def run_agentic_review(
     cfg: dict,
 ) -> list[ReviewFindingLLM]:
     """Runs the agentic review pass. Retries are routed through
-    failure_router.classify_failure instead of a second failure path.
+    failure_router.classify_failure instead of a second failure path, per
+    the spec's explicit constraint (§3.3).
+
+    Caller's responsibility: `diff_hunk` should already be scoped to a
+    single file/hunk, not an entire branch diff — see
+    diff_symbols.split_diff_by_file(). This function still enforces a
+    hard cap on the diff text itself as a last-resort safety net (a
+    single file's diff can still be huge), even though the spec's
+    "diff hunk never truncated" language assumed hunk-sized input.
+    Truncating here beats a 413 from the provider.
     """
     from gitscribe.core.llm_client import build_chat_model
 
@@ -232,3 +253,202 @@ def write_agentic_findings(findings: list[ReviewFindingLLM], symbol_id: int | No
         )
     conn.commit()
     return len(findings)
+
+
+class _BatchReviewFindingLLM(ReviewFindingLLM):
+    file: str = Field(description="which file this finding applies to")
+
+
+class _BatchReviewResponse(BaseModel):
+    findings: list[_BatchReviewFindingLLM] = Field(default_factory=list)
+
+
+_BATCH_REVIEW_PARSER = PydanticOutputParser(pydantic_object=_BatchReviewResponse)
+
+_BATCH_REVIEW_PROMPT = """You are reviewing several files changed in one commit for correctness, \
+risk, and maintainability issues a linter would miss.
+
+{files_block}
+
+Respond with findings only where you have a concrete, specific concern. Every \
+finding MUST include which file it applies to.
+{format_instructions}
+"""
+
+
+def _should_escalate_to_agentic(symbol_ids: list[int], min_blast_radius: int | None = None) -> bool:
+    """The gate: True means "worth an LLM call", False means "lint signal
+    is clean, skip it". Unresolvable diffs (empty symbol_ids — e.g. a
+    brand-new file not yet indexed) can't be gated safely, so they default
+    to True rather than silently never being reviewed.
+
+    Lint error findings are the primary, repo-agnostic signal — ruff's
+    bandit-style rules already run on the current tree, so anything like
+    eval()/exec()/subprocess is caught there regardless of repo size.
+    Blast radius is opt-in (min_blast_radius=None disables it) because a
+    fixed absolute threshold doesn't generalize: measured on one real
+    repo, blast radius had a MEDIAN of 5 across all functions, so a naive
+    default of "skip below 5" gated essentially nothing.
+    """
+    if not symbol_ids:
+        return True
+
+    conn = _get_connection()
+    placeholders = ",".join("?" * len(symbol_ids))
+    error_count = conn.execute(
+        f"""SELECT COUNT(*) AS n FROM review_findings
+            WHERE severity = 'error' AND symbol_id IN ({placeholders})""",
+        symbol_ids,
+    ).fetchone()["n"]
+    if error_count > 0:
+        return True
+
+    if min_blast_radius is None:
+        return False
+
+    max_radius = max((len(blast_radius(sid, max_depth=3)) for sid in symbol_ids), default=0)
+    return max_radius >= min_blast_radius
+
+
+def _light_context_block(changed_symbol_ids: list[int], hops: int) -> str:
+    """Cheaper than _assemble_review_context: names only, no siblings, no
+    per-block truncation bookkeeping — batched calls already pack several
+    files per prompt, so each file's own context share needs to stay small.
+    """
+    names: list[str] = []
+    for sid in changed_symbol_ids:
+        for r in blast_radius(sid, max_depth=hops):
+            names.append(f"{r.direction}:{r.name}")
+    return ", ".join(names[:15]) if names else "(none)"
+
+
+def _pack_into_batches(
+    items: list[tuple[str, str, list[int]]], max_tokens: int
+) -> list[list[tuple[str, str, list[int]]]]:
+    """Greedy bin-packing by estimated token size. `items` is
+    (file, diff_text, symbol_ids). Oversized single items go in their own
+    batch and get truncated later by the per-file fallback, not dropped.
+    """
+    batches: list[list[tuple[str, str, list[int]]]] = []
+    current: list[tuple[str, str, list[int]]] = []
+    current_tokens = 0
+
+    for file, diff_text, symbol_ids in items:
+        cost = _estimate_tokens(diff_text) + 100  # rough per-file scaffolding overhead
+        if current and current_tokens + cost > max_tokens:
+            batches.append(current)
+            current, current_tokens = [], 0
+        current.append((file, diff_text, symbol_ids))
+        current_tokens += cost
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _run_batch_call(
+    batch: list[tuple[str, str, list[int]]], cfg: dict
+) -> list[_BatchReviewFindingLLM]:
+    from gitscribe.core.llm_client import build_chat_model
+
+    review_cfg = cfg.get("review", {}).get("agentic", {})
+    hops = review_cfg.get("hops", 2)
+    max_retries = cfg.get("failure_handling", {}).get("max_retries", 2)
+
+    sections = []
+    for file, diff_text, symbol_ids in batch:
+        context = _light_context_block(symbol_ids, hops)
+        sections.append(f"### FILE: {file}\n{diff_text}\nRelated symbols: {context}")
+    files_block = "\n\n".join(sections)
+
+    prompt = _BATCH_REVIEW_PROMPT.format(
+        files_block=files_block,
+        format_instructions=_BATCH_REVIEW_PARSER.get_format_instructions(),
+    )
+
+    model_name = cfg["llm"]["model"]
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            llm = build_chat_model(cfg, model_name, temperature=0.1)
+            ai_msg = llm.invoke(prompt)
+            parsed: _BatchReviewResponse = _BATCH_REVIEW_PARSER.invoke(ai_msg.content)
+            return parsed.findings
+        except Exception as exc:  # noqa: BLE001 — same classify-don't-swallow pattern as run_agentic_review
+            last_error = exc
+            if classify_failure(str(exc)) == "bad_output" or attempt == max_retries:
+                break
+    if last_error is not None:
+        raise last_error
+    return []
+
+
+def run_batched_agentic_review(
+    per_file_diffs: dict[str, str], cfg: dict
+) -> tuple[dict[str, list[ReviewFindingLLM]], dict[str, int | None], set[str]]:
+    """Top-level entry point: gate, then batch, then call. Returns
+    (findings_by_file, anchor_symbol_by_file, reviewed_files) — the third
+    value is which files actually passed the gate and went to the LLM,
+    distinct from "went to the LLM and came back clean" (both look like
+    an empty findings list otherwise, and callers reporting a skip count
+    need to tell those apart).
+
+    Replaces calling run_agentic_review() once per file — that sends one
+    LLM call per changed file regardless of whether the file needs a
+    second opinion; this sends zero calls for files lint/structural
+    signal already vouches for, and packs the rest into as few calls as
+    fit the token budget.
+    """
+    review_cfg = cfg.get("review", {}).get("agentic", {})
+    max_context_tokens = review_cfg.get("max_context_tokens", 6000)
+    min_blast_radius = review_cfg.get("min_blast_radius_for_review", None)
+
+    candidates: list[tuple[str, str, list[int]]] = []
+    anchors: dict[str, int | None] = {}
+    for file, diff_text in per_file_diffs.items():
+        symbol_ids = changed_symbol_ids(diff_text)
+        anchors[file] = symbol_ids[0] if symbol_ids else None
+        if _should_escalate_to_agentic(symbol_ids, min_blast_radius):
+            candidates.append((file, diff_text, symbol_ids))
+
+    reviewed_files = {c[0] for c in candidates}
+    results: dict[str, list[ReviewFindingLLM]] = {f: [] for f in per_file_diffs}
+    if not candidates:
+        return results, anchors, reviewed_files
+
+    batches = _pack_into_batches(candidates, max_context_tokens)
+    for batch in batches:
+        if len(batch) == 1 and _estimate_tokens(batch[0][1]) > max_context_tokens:
+            # too big to batch with anything else and too big on its own —
+            # fall back to the single-file path, which truncates as a
+            # last resort instead of failing the whole batch.
+            file, diff_text, symbol_ids = batch[0]
+            results[file] = run_agentic_review(diff_text, symbol_ids, cfg)
+            continue
+
+        findings = _run_batch_call(batch, cfg)
+        for f in findings:
+            results.setdefault(f.file, []).append(
+                ReviewFindingLLM(
+                    severity=f.severity,
+                    rule_or_reason=f.rule_or_reason,
+                    message=f.message,
+                    line_start=f.line_start,
+                    line_end=f.line_end,
+                )
+            )
+
+    return results, anchors, reviewed_files
+
+
+def write_agentic_findings_by_file(
+    results: dict[str, list[ReviewFindingLLM]], anchors: dict[str, int | None]
+) -> int:
+    """Writes every file's findings, anchored to that file's own changed
+    symbol — not one global anchor across the whole (formerly whole-branch)
+    diff, which was the pre-batching behavior."""
+    total = 0
+    for file, findings in results.items():
+        if findings:
+            total += write_agentic_findings(findings, anchors.get(file))
+    return total
