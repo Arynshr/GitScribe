@@ -1,17 +1,18 @@
 """
-core/analysis/rag.py
 Query -> embed -> vector search -> graph-expand -> assembled context.
 Replaces/augments today's branch-prefix PR retrieval with code-aware
-context. Public API from day one — Stage 4's `gitscribe query` CLI and
-generator.py both call this module directly.
+context.
 """
 
 from __future__ import annotations
+
+import time
 
 from pydantic import BaseModel, Field
 from langchain_core.output_parsers import PydanticOutputParser
 
 from gitscribe.core.analysis.diff_symbols import changed_symbol_ids
+from gitscribe.core.generator import _extract_json_block
 
 from gitscribe.core.failure_router import classify_failure
 from gitscribe.core.indexer.index_store import SearchResult, _get_connection, blast_radius, search
@@ -96,11 +97,6 @@ def answer_query(query: str, context: RAGContext, cfg: dict):
     prompt = _SYNTHESIS_PROMPT.format(context_block=context.as_prompt_block(), query=query)
     response = model.invoke(prompt)
     return response.content
-
-
-# ---------------------------------------------------------------------------
-# Agentic review pass (spec §3.3)
-# ---------------------------------------------------------------------------
 
 _TOKENS_PER_CHAR = 0.25  # rough estimate; good enough for a hard budget cap
 
@@ -195,15 +191,7 @@ def run_agentic_review(
 ) -> list[ReviewFindingLLM]:
     """Runs the agentic review pass. Retries are routed through
     failure_router.classify_failure instead of a second failure path, per
-    the spec's explicit constraint (§3.3).
-
-    Caller's responsibility: `diff_hunk` should already be scoped to a
-    single file/hunk, not an entire branch diff — see
-    diff_symbols.split_diff_by_file(). This function still enforces a
-    hard cap on the diff text itself as a last-resort safety net (a
-    single file's diff can still be huge), even though the spec's
-    "diff hunk never truncated" language assumed hunk-sized input.
-    Truncating here beats a 413 from the provider.
+    the spec's explicit constraint.
     """
     from gitscribe.core.llm_client import build_chat_model
 
@@ -225,18 +213,29 @@ def run_agentic_review(
     )
 
     model_name = cfg["llm"]["model"]
+    fallback_model = cfg["llm"].get("fallback_model", model_name)
+    backoff = cfg.get("failure_handling", {}).get("retry_backoff_seconds", 0)
     last_error: Exception | None = None
+    failure_type: str | None = None
     for attempt in range(max_retries + 1):
+        # bad_output on the previous attempt switches to fallback_model
+        # (mirrors graph.py's retry_fallback_model_node) instead of
+        # retrying the same model against the same malformed-output
+        # failure, which rarely helps.
+        current_model = fallback_model if failure_type == "bad_output" else model_name
         try:
-            llm = build_chat_model(cfg, model_name, temperature=0.1)
+            llm = build_chat_model(cfg, current_model, temperature=0.1)
             ai_msg = llm.invoke(prompt)
-            parsed: ReviewFindingsLLM = _REVIEW_PARSER.invoke(ai_msg.content)
+            cleaned = _extract_json_block(ai_msg.content)
+            parsed: ReviewFindingsLLM = _REVIEW_PARSER.invoke(cleaned)
             return parsed.findings
         except Exception as exc:  # noqa: BLE001 — classify via failure_router, don't swallow silently
             last_error = exc
             failure_type = classify_failure(str(exc))
-            if failure_type == "bad_output" or attempt == max_retries:
+            if attempt == max_retries:
                 break
+            if failure_type in ("rate_limit", "timeout") and backoff:
+                time.sleep(backoff)
     if last_error is not None:
         raise last_error
     return []
@@ -281,14 +280,6 @@ def _should_escalate_to_agentic(symbol_ids: list[int], min_blast_radius: int | N
     is clean, skip it". Unresolvable diffs (empty symbol_ids — e.g. a
     brand-new file not yet indexed) can't be gated safely, so they default
     to True rather than silently never being reviewed.
-
-    Lint error findings are the primary, repo-agnostic signal — ruff's
-    bandit-style rules already run on the current tree, so anything like
-    eval()/exec()/subprocess is caught there regardless of repo size.
-    Blast radius is opt-in (min_blast_radius=None disables it) because a
-    fixed absolute threshold doesn't generalize: measured on one real
-    repo, blast radius had a MEDIAN of 5 across all functions, so a naive
-    default of "skip below 5" gated essentially nothing.
     """
     if not symbol_ids:
         return True
@@ -367,17 +358,25 @@ def _run_batch_call(
     )
 
     model_name = cfg["llm"]["model"]
+    fallback_model = cfg["llm"].get("fallback_model", model_name)
+    backoff = cfg.get("failure_handling", {}).get("retry_backoff_seconds", 0)
     last_error: Exception | None = None
+    failure_type: str | None = None
     for attempt in range(max_retries + 1):
+        current_model = fallback_model if failure_type == "bad_output" else model_name
         try:
-            llm = build_chat_model(cfg, model_name, temperature=0.1)
+            llm = build_chat_model(cfg, current_model, temperature=0.1)
             ai_msg = llm.invoke(prompt)
-            parsed: _BatchReviewResponse = _BATCH_REVIEW_PARSER.invoke(ai_msg.content)
+            cleaned = _extract_json_block(ai_msg.content)
+            parsed: _BatchReviewResponse = _BATCH_REVIEW_PARSER.invoke(cleaned)
             return parsed.findings
         except Exception as exc:  # noqa: BLE001 — same classify-don't-swallow pattern as run_agentic_review
             last_error = exc
-            if classify_failure(str(exc)) == "bad_output" or attempt == max_retries:
+            failure_type = classify_failure(str(exc))
+            if attempt == max_retries:
                 break
+            if failure_type in ("rate_limit", "timeout") and backoff:
+                time.sleep(backoff)
     if last_error is not None:
         raise last_error
     return []
@@ -391,13 +390,7 @@ def run_batched_agentic_review(
     value is which files actually passed the gate and went to the LLM,
     distinct from "went to the LLM and came back clean" (both look like
     an empty findings list otherwise, and callers reporting a skip count
-    need to tell those apart).
-
-    Replaces calling run_agentic_review() once per file — that sends one
-    LLM call per changed file regardless of whether the file needs a
-    second opinion; this sends zero calls for files lint/structural
-    signal already vouches for, and packs the rest into as few calls as
-    fit the token budget.
+    need to tell those apart). 
     """
     review_cfg = cfg.get("review", {}).get("agentic", {})
     max_context_tokens = review_cfg.get("max_context_tokens", 6000)
