@@ -227,3 +227,5 @@ __pycache__/
 Storage/*.db
 .jsonl
 .patch 
+.repomixignore
+repomix.config.json

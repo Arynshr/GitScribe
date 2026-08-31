@@ -40,7 +40,7 @@ from gitscribe.core.summarizer import summarizer_node
 # usecwd=True: resolve relative to where the command is run, not cli.py's own
 load_dotenv(find_dotenv(usecwd=True))
 
-app = typer.Typer(help="GitScribe: stateful PR description generator (LangGraph-powered)")
+app = typer.Typer(help="GitScribe: A stateful AI-powered Git and code intelligence system")
 
 ENV_PATH = Path(".env")
 repo_hooks_dir = Path(".git") / "hooks"
