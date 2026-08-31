@@ -1,19 +1,15 @@
 """
-core/analysis/semantic_checks.py
-Stage 3: structural signal from the code graph — cycles, dead code
-(via reachability), high fan-in/out. Consumes index_store's public API
-only (no direct DB access) — keeps this module decoupled from schema
-changes in the indexer.
+Structural signal from the code graph — cycles, dead code
+(via reachability), high fan-in/out.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
 from pydantic import BaseModel
 
-from gitscribe.core.indexer.index_store import INDEX_DB_PATH
+from gitscribe.core.indexer.index_store import _get_connection as _index_conn
 
 
 class CycleFinding(BaseModel):
@@ -35,9 +31,11 @@ class FanFinding(BaseModel):
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(Path(INDEX_DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Delegates to index_store's connection helper -- keeps schema init
+    and pragmas (foreign keys, WAL, busy_timeout) in one place instead of
+    duplicating a second raw sqlite3.connect() against the same DB file,
+    which is what this module's own docstring already promises."""
+    return _index_conn()
 
 
 def find_cycles(max_depth: int = 6) -> list[CycleFinding]:

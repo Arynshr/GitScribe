@@ -3,6 +3,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from enum import StrEnum
 from pathlib import Path
 
@@ -37,7 +38,6 @@ from gitscribe.core.merge_preview import WorktreeError, run_merge_preview
 from gitscribe.core.state import GitScribeState
 from gitscribe.core.summarizer import summarizer_node
 
-# usecwd=True: resolve relative to where the command is run, not cli.py's own
 load_dotenv(find_dotenv(usecwd=True))
 
 app = typer.Typer(help="GitScribe: A stateful AI-powered Git and code intelligence system")
@@ -319,7 +319,17 @@ def create_pr(
             raise typer.Exit(1)
         console.info(f"{console.PREFIX} '{branch}' has no upstream — pushing to origin...")
         try:
-            subprocess.run(["git", "push", "-u", "origin", branch], check=True)
+            # --no-verify: this push is create-pr's own internal step (to
+            # satisfy `gh pr create`'s remote-branch requirement), not a
+            # user-initiated push. Without --no-verify this re-fires the
+            # installed pre-push hook (gitscribe pre-push), which -- on a
+            # branch with no upstream -- itself calls `gitscribe create-pr`
+            # again, which pushes again, re-firing the hook again: an
+            # unbounded recursive loop on the very first push of a new
+            # branch. The risk check has already run once for this diff;
+            # re-running it on GitScribe's own plumbing push serves no
+            # purpose and is the actual cause of the loop.
+            subprocess.run(["git", "push", "-u", "origin", branch, "--no-verify"], check=True)
         except subprocess.CalledProcessError as e:
             console.error("`git push` failed — see output above.")
             raise typer.Exit(e.returncode or 1) from e
@@ -606,10 +616,10 @@ def pre_push_cmd():
             print("blocked — override with: git push --no-verify")
             raise typer.Exit(code=1)
 
-    has_upstream = subprocess.run(
+    no_upstream = subprocess.run(
         ["git", "rev-parse", "-q", "--verify", "@{u}"], capture_output=True
     ).returncode != 0
-    if has_upstream:
+    if no_upstream:
         subprocess.run(["gitscribe", "create-pr"])
 
 
