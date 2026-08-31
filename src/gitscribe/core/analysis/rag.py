@@ -1,16 +1,21 @@
 """
-core/analysis/rag.py
 Query -> embed -> vector search -> graph-expand -> assembled context.
 Replaces/augments today's branch-prefix PR retrieval with code-aware
-context. Public API from day one — Stage 4's `gitscribe query` CLI and
-generator.py both call this module directly.
+context.
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+import time
 
-from gitscribe.core.indexer.index_store import SearchResult, blast_radius, search
+from pydantic import BaseModel, Field
+from langchain_core.output_parsers import PydanticOutputParser
+
+from gitscribe.core.analysis.diff_symbols import changed_symbol_ids
+from gitscribe.core.generator import _extract_json_block
+
+from gitscribe.core.failure_router import classify_failure
+from gitscribe.core.indexer.index_store import SearchResult, _get_connection, blast_radius, search
 
 
 class ContextSnippet(BaseModel):
@@ -92,3 +97,351 @@ def answer_query(query: str, context: RAGContext, cfg: dict):
     prompt = _SYNTHESIS_PROMPT.format(context_block=context.as_prompt_block(), query=query)
     response = model.invoke(prompt)
     return response.content
+
+_TOKENS_PER_CHAR = 0.25  # rough estimate; good enough for a hard budget cap
+
+
+def _estimate_tokens(text: str) -> int:
+    return int(len(text) * _TOKENS_PER_CHAR)
+
+
+class ReviewFindingLLM(BaseModel):
+    severity: str = Field(description="one of: info, warning, error")
+    rule_or_reason: str = Field(description="short label for what triggered this finding")
+    message: str = Field(description="the finding itself, specific and actionable")
+    line_start: int | None = None
+    line_end: int | None = None
+
+
+class ReviewFindingsLLM(BaseModel):
+    findings: list[ReviewFindingLLM] = Field(default_factory=list)
+
+
+_REVIEW_PARSER = PydanticOutputParser(pydantic_object=ReviewFindingsLLM)
+
+_REVIEW_PROMPT = """You are reviewing a code change for correctness, risk, and \
+maintainability issues a linter would miss.
+
+Diff hunk (never omit or summarize — review this exactly as given):
+{diff_hunk}
+
+Direct callers of the changed code:
+{callers_block}
+
+Direct callees of the changed code:
+{callees_block}
+
+Same-file siblings (may be omitted below due to context budget):
+{siblings_block}
+
+Respond with findings only where you have a concrete, specific concern.
+{format_instructions}
+"""
+
+
+def _assemble_review_context(
+    diff_hunk: str, changed_symbol_ids: list[int], hops: int, max_context_tokens: int
+) -> dict[str, str]:
+    """Fixed assembly order (spec §3.3): diff hunk (never truncated) ->
+    callers -> callees -> siblings, dropped in that reverse priority when
+    over budget."""
+    callers: list[str] = []
+    callees: list[str] = []
+    siblings: list[str] = []
+
+    for sid in changed_symbol_ids:
+        for r in blast_radius(sid, max_depth=hops):
+            line = f"{r.name} ({r.file}:{r.lineno}, depth={r.depth})"
+            (callers if r.direction == "caller" else callees).append(line)
+
+    conn = _get_connection()
+    for sid in changed_symbol_ids:
+        row = conn.execute("SELECT file FROM symbols WHERE id = ?", (sid,)).fetchone()
+        if row is None:
+            continue
+        sib_rows = conn.execute(
+            "SELECT name, lineno FROM symbols WHERE file = ? AND id != ?", (row["file"], sid)
+        ).fetchall()
+        siblings.extend(f"{r['name']} (line {r['lineno']})" for r in sib_rows)
+
+    budget = max_context_tokens - _estimate_tokens(diff_hunk)
+    blocks = {"callers_block": "", "callees_block": "", "siblings_block": ""}
+
+    # Priority: callers, then callees, then siblings — truncate siblings first.
+    for key, items in (("callers_block", callers), ("callees_block", callees), ("siblings_block", siblings)):
+        text = "\n".join(items) or "(none)"
+        cost = _estimate_tokens(text)
+        if cost > budget:
+            kept = items[:]
+            while kept and _estimate_tokens("\n".join(kept)) > budget:
+                kept.pop()
+            text = "\n".join(kept) if kept else "(omitted — over context budget)"
+            budget = max(budget - _estimate_tokens(text), 0)
+        else:
+            budget -= cost
+        blocks[key] = text
+
+    return blocks
+
+
+def run_agentic_review(
+    diff_hunk: str,
+    changed_symbol_ids: list[int],
+    cfg: dict,
+) -> list[ReviewFindingLLM]:
+    """Runs the agentic review pass. Retries are routed through
+    failure_router.classify_failure instead of a second failure path, per
+    the spec's explicit constraint.
+    """
+    from gitscribe.core.llm_client import build_chat_model
+
+    review_cfg = cfg.get("review", {}).get("agentic", {})
+    hops = review_cfg.get("hops", 2)
+    max_context_tokens = review_cfg.get("max_context_tokens", 6000)
+    max_retries = cfg.get("failure_handling", {}).get("max_retries", 2)
+
+    diff_budget = int(max_context_tokens * 0.6)  # leave room for context + prompt scaffolding
+    if _estimate_tokens(diff_hunk) > diff_budget:
+        max_chars = int(diff_budget / _TOKENS_PER_CHAR)
+        diff_hunk = diff_hunk[:max_chars] + "\n[... diff truncated, exceeded per-call token budget ...]"
+
+    context = _assemble_review_context(diff_hunk, changed_symbol_ids, hops, max_context_tokens)
+    prompt = _REVIEW_PROMPT.format(
+        diff_hunk=diff_hunk,
+        format_instructions=_REVIEW_PARSER.get_format_instructions(),
+        **context,
+    )
+
+    model_name = cfg["llm"]["model"]
+    fallback_model = cfg["llm"].get("fallback_model", model_name)
+    backoff = cfg.get("failure_handling", {}).get("retry_backoff_seconds", 0)
+    last_error: Exception | None = None
+    failure_type: str | None = None
+    for attempt in range(max_retries + 1):
+        # bad_output on the previous attempt switches to fallback_model
+        # (mirrors graph.py's retry_fallback_model_node) instead of
+        # retrying the same model against the same malformed-output
+        # failure, which rarely helps.
+        current_model = fallback_model if failure_type == "bad_output" else model_name
+        try:
+            llm = build_chat_model(cfg, current_model, temperature=0.1)
+            ai_msg = llm.invoke(prompt)
+            cleaned = _extract_json_block(ai_msg.content)
+            parsed: ReviewFindingsLLM = _REVIEW_PARSER.invoke(cleaned)
+            return parsed.findings
+        except Exception as exc:  # noqa: BLE001 — classify via failure_router, don't swallow silently
+            last_error = exc
+            failure_type = classify_failure(str(exc))
+            if attempt == max_retries:
+                break
+            if failure_type in ("rate_limit", "timeout") and backoff:
+                time.sleep(backoff)
+    if last_error is not None:
+        raise last_error
+    return []
+
+
+def write_agentic_findings(findings: list[ReviewFindingLLM], symbol_id: int | None) -> int:
+    conn = _get_connection()
+    for f in findings:
+        conn.execute(
+            """INSERT INTO review_findings
+               (symbol_id, source, severity, rule_or_reason, message, line_start, line_end)
+               VALUES (?, 'agentic', ?, ?, ?, ?, ?)""",
+            (symbol_id, f.severity, f.rule_or_reason, f.message, f.line_start, f.line_end),
+        )
+    conn.commit()
+    return len(findings)
+
+
+class _BatchReviewFindingLLM(ReviewFindingLLM):
+    file: str = Field(description="which file this finding applies to")
+
+
+class _BatchReviewResponse(BaseModel):
+    findings: list[_BatchReviewFindingLLM] = Field(default_factory=list)
+
+
+_BATCH_REVIEW_PARSER = PydanticOutputParser(pydantic_object=_BatchReviewResponse)
+
+_BATCH_REVIEW_PROMPT = """You are reviewing several files changed in one commit for correctness, \
+risk, and maintainability issues a linter would miss.
+
+{files_block}
+
+Respond with findings only where you have a concrete, specific concern. Every \
+finding MUST include which file it applies to.
+{format_instructions}
+"""
+
+
+def _should_escalate_to_agentic(symbol_ids: list[int], min_blast_radius: int | None = None) -> bool:
+    """The gate: True means "worth an LLM call", False means "lint signal
+    is clean, skip it". Unresolvable diffs (empty symbol_ids — e.g. a
+    brand-new file not yet indexed) can't be gated safely, so they default
+    to True rather than silently never being reviewed.
+    """
+    if not symbol_ids:
+        return True
+
+    conn = _get_connection()
+    placeholders = ",".join("?" * len(symbol_ids))
+    error_count = conn.execute(
+        f"""SELECT COUNT(*) AS n FROM review_findings
+            WHERE severity = 'error' AND symbol_id IN ({placeholders})""",
+        symbol_ids,
+    ).fetchone()["n"]
+    if error_count > 0:
+        return True
+
+    if min_blast_radius is None:
+        return False
+
+    max_radius = max((len(blast_radius(sid, max_depth=3)) for sid in symbol_ids), default=0)
+    return max_radius >= min_blast_radius
+
+
+def _light_context_block(changed_symbol_ids: list[int], hops: int) -> str:
+    """Cheaper than _assemble_review_context: names only, no siblings, no
+    per-block truncation bookkeeping — batched calls already pack several
+    files per prompt, so each file's own context share needs to stay small.
+    """
+    names: list[str] = []
+    for sid in changed_symbol_ids:
+        for r in blast_radius(sid, max_depth=hops):
+            names.append(f"{r.direction}:{r.name}")
+    return ", ".join(names[:15]) if names else "(none)"
+
+
+def _pack_into_batches(
+    items: list[tuple[str, str, list[int]]], max_tokens: int
+) -> list[list[tuple[str, str, list[int]]]]:
+    """Greedy bin-packing by estimated token size. `items` is
+    (file, diff_text, symbol_ids). Oversized single items go in their own
+    batch and get truncated later by the per-file fallback, not dropped.
+    """
+    batches: list[list[tuple[str, str, list[int]]]] = []
+    current: list[tuple[str, str, list[int]]] = []
+    current_tokens = 0
+
+    for file, diff_text, symbol_ids in items:
+        cost = _estimate_tokens(diff_text) + 100  # rough per-file scaffolding overhead
+        if current and current_tokens + cost > max_tokens:
+            batches.append(current)
+            current, current_tokens = [], 0
+        current.append((file, diff_text, symbol_ids))
+        current_tokens += cost
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _run_batch_call(
+    batch: list[tuple[str, str, list[int]]], cfg: dict
+) -> list[_BatchReviewFindingLLM]:
+    from gitscribe.core.llm_client import build_chat_model
+
+    review_cfg = cfg.get("review", {}).get("agentic", {})
+    hops = review_cfg.get("hops", 2)
+    max_retries = cfg.get("failure_handling", {}).get("max_retries", 2)
+
+    sections = []
+    for file, diff_text, symbol_ids in batch:
+        context = _light_context_block(symbol_ids, hops)
+        sections.append(f"### FILE: {file}\n{diff_text}\nRelated symbols: {context}")
+    files_block = "\n\n".join(sections)
+
+    prompt = _BATCH_REVIEW_PROMPT.format(
+        files_block=files_block,
+        format_instructions=_BATCH_REVIEW_PARSER.get_format_instructions(),
+    )
+
+    model_name = cfg["llm"]["model"]
+    fallback_model = cfg["llm"].get("fallback_model", model_name)
+    backoff = cfg.get("failure_handling", {}).get("retry_backoff_seconds", 0)
+    last_error: Exception | None = None
+    failure_type: str | None = None
+    for attempt in range(max_retries + 1):
+        current_model = fallback_model if failure_type == "bad_output" else model_name
+        try:
+            llm = build_chat_model(cfg, current_model, temperature=0.1)
+            ai_msg = llm.invoke(prompt)
+            cleaned = _extract_json_block(ai_msg.content)
+            parsed: _BatchReviewResponse = _BATCH_REVIEW_PARSER.invoke(cleaned)
+            return parsed.findings
+        except Exception as exc:  # noqa: BLE001 — same classify-don't-swallow pattern as run_agentic_review
+            last_error = exc
+            failure_type = classify_failure(str(exc))
+            if attempt == max_retries:
+                break
+            if failure_type in ("rate_limit", "timeout") and backoff:
+                time.sleep(backoff)
+    if last_error is not None:
+        raise last_error
+    return []
+
+
+def run_batched_agentic_review(
+    per_file_diffs: dict[str, str], cfg: dict
+) -> tuple[dict[str, list[ReviewFindingLLM]], dict[str, int | None], set[str]]:
+    """Top-level entry point: gate, then batch, then call. Returns
+    (findings_by_file, anchor_symbol_by_file, reviewed_files) — the third
+    value is which files actually passed the gate and went to the LLM,
+    distinct from "went to the LLM and came back clean" (both look like
+    an empty findings list otherwise, and callers reporting a skip count
+    need to tell those apart). 
+    """
+    review_cfg = cfg.get("review", {}).get("agentic", {})
+    max_context_tokens = review_cfg.get("max_context_tokens", 6000)
+    min_blast_radius = review_cfg.get("min_blast_radius_for_review", None)
+
+    candidates: list[tuple[str, str, list[int]]] = []
+    anchors: dict[str, int | None] = {}
+    for file, diff_text in per_file_diffs.items():
+        symbol_ids = changed_symbol_ids(diff_text)
+        anchors[file] = symbol_ids[0] if symbol_ids else None
+        if _should_escalate_to_agentic(symbol_ids, min_blast_radius):
+            candidates.append((file, diff_text, symbol_ids))
+
+    reviewed_files = {c[0] for c in candidates}
+    results: dict[str, list[ReviewFindingLLM]] = {f: [] for f in per_file_diffs}
+    if not candidates:
+        return results, anchors, reviewed_files
+
+    batches = _pack_into_batches(candidates, max_context_tokens)
+    for batch in batches:
+        if len(batch) == 1 and _estimate_tokens(batch[0][1]) > max_context_tokens:
+            # too big to batch with anything else and too big on its own —
+            # fall back to the single-file path, which truncates as a
+            # last resort instead of failing the whole batch.
+            file, diff_text, symbol_ids = batch[0]
+            results[file] = run_agentic_review(diff_text, symbol_ids, cfg)
+            continue
+
+        findings = _run_batch_call(batch, cfg)
+        for f in findings:
+            results.setdefault(f.file, []).append(
+                ReviewFindingLLM(
+                    severity=f.severity,
+                    rule_or_reason=f.rule_or_reason,
+                    message=f.message,
+                    line_start=f.line_start,
+                    line_end=f.line_end,
+                )
+            )
+
+    return results, anchors, reviewed_files
+
+
+def write_agentic_findings_by_file(
+    results: dict[str, list[ReviewFindingLLM]], anchors: dict[str, int | None]
+) -> int:
+    """Writes every file's findings, anchored to that file's own changed
+    symbol — not one global anchor across the whole (formerly whole-branch)
+    diff, which was the pre-batching behavior."""
+    total = 0
+    for file, findings in results.items():
+        if findings:
+            total += write_agentic_findings(findings, anchors.get(file))
+    return total

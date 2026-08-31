@@ -1,7 +1,3 @@
-"""
-Validates config.yaml on load. A malformed config now fails immediately
-with a clear message instead of a raw KeyError three nodes deep.
-"""
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -25,6 +21,7 @@ class RetrievalConfig(BaseModel):
 class RiskClassifierConfig(BaseModel):
     enabled: bool = True
     trivial_threshold: float = Field(ge=0.0, le=1.0, default=0.15)
+    structural_weight: float = Field(ge=0.0, le=1.0, default=0.3)
 
 
 class FailureHandlingConfig(BaseModel):
@@ -43,6 +40,34 @@ class MergePreviewConfig(BaseModel):
     worktree_cleanup: bool = True
 
 
+class LintReviewConfig(BaseModel):
+    enabled: bool = True
+
+
+class AgenticReviewConfig(BaseModel):
+    enabled: bool = True
+    max_context_tokens: int = Field(gt=0, default=6000)
+    hops: int = Field(gt=0, default=2)
+    min_blast_radius_for_review: int | None = Field(
+        default=None,
+        description="Optional secondary gate: also escalate a file to the "
+        "agentic pass if its max blast radius meets/exceeds this, even "
+        "with no lint error findings. Off by default — a fixed threshold "
+        "doesn't generalize across repos of different size/connectivity "
+        "(e.g. one real repo measured had a MEDIAN blast radius of 5 "
+        "across all functions, so a naive default of 5 gated nothing). "
+        "If you enable this, measure your own repo's blast-radius "
+        "distribution first and set it well above the median/p90, not a "
+        "guessed number. Lint error findings remain the primary, "
+        "repo-agnostic gate regardless of this setting.",
+    )
+
+
+class ReviewConfig(BaseModel):
+    lint: LintReviewConfig = LintReviewConfig()
+    agentic: AgenticReviewConfig = AgenticReviewConfig()
+
+
 class GitScribeConfig(BaseModel):
     llm: LLMConfig
     retrieval: RetrievalConfig = RetrievalConfig()
@@ -50,8 +75,8 @@ class GitScribeConfig(BaseModel):
     failure_handling: FailureHandlingConfig = FailureHandlingConfig()
     embedding: EmbeddingConfig = EmbeddingConfig()
     merge_preview: MergePreviewConfig = MergePreviewConfig()
+    review: ReviewConfig = ReviewConfig()
     ignore_patterns: list[str] = Field(default_factory=list)
 
     def as_dict(self) -> dict:
-        """Node functions currently index cfg["section"]["key"] - keep that working."""
         return self.model_dump()

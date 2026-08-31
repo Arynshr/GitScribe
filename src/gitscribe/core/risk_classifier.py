@@ -1,10 +1,17 @@
 """
 Agentic node #1: semantic triviality/risk classification.
+
+risk_classifier_node is unchanged (still the pure-LLM node — keeping it
+as-is means graph.py's existing wiring, tests, and the standalone import
+all still work). risk_classifier_node_blended wraps it with the spec §3.5
+structural signal and is what build_graph should point at instead.
 """
 
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
+from gitscribe.core.analysis.diff_symbols import changed_symbol_ids
+from gitscribe.core.indexer.index_store import _get_connection as _index_conn, blast_radius
 from gitscribe.core.llm_client import build_chat_model
 from gitscribe.core.state import GitScribeState
 
@@ -56,6 +63,65 @@ def risk_classifier_node(state: GitScribeState, cfg: dict) -> dict:
         "risk_score": risk_score,
         "risk_reasoning": reasoning,
         "skip_generation": risk_score < threshold,
+    }
+
+
+def _structural_signal(symbol_ids: list[int]) -> tuple[float, str]:
+    if not symbol_ids:
+        return 0.0, "no changed symbols resolved for structural analysis"
+
+    conn = _index_conn()
+    placeholders = ",".join("?" * len(symbol_ids))
+    error_count = conn.execute(
+        f"""SELECT COUNT(*) AS n FROM review_findings
+            WHERE severity = 'error' AND symbol_id IN ({placeholders})""",
+        symbol_ids,
+    ).fetchone()["n"]
+
+    max_radius = max((len(blast_radius(sid, max_depth=3)) for sid in symbol_ids), default=0)
+
+    # Simple, explainable normalization — same philosophy as linter.py's
+    # severity_score: no magic weighting beyond the configured blend.
+    error_component = min(error_count / 5.0, 1.0)
+    radius_component = min(max_radius / 20.0, 1.0)
+    structural_score = (error_component + radius_component) / 2.0
+
+    reasoning = (
+        f"structural signal: {error_count} error-severity finding(s), "
+        f"max blast radius {max_radius} across {len(symbol_ids)} changed symbol(s)"
+    )
+    return structural_score, reasoning
+
+
+def risk_classifier_node_blended(state: GitScribeState, cfg: dict) -> dict:
+    """Structural data folds into risk_reasoning as text, no new state field. weight=0 reproduces
+    risk_classifier_node's behavior exactly.
+    """
+    base = risk_classifier_node(state, cfg)
+    weight = cfg.get("risk_classifier", {}).get("structural_weight", 0.0)
+    if weight <= 0 or not cfg["risk_classifier"]["enabled"]:
+        return base
+
+    symbol_ids = changed_symbol_ids(state.raw_diff)
+    if not symbol_ids:
+        return {
+            **base,
+            "risk_reasoning": f"{base.get('risk_reasoning', '')}\n"
+            f"[structural] unavailable (no changed symbols resolved — "
+            f"run `gitscribe index` or check the diff maps to indexed code); "
+            f"using LLM score unblended",
+        }
+
+    structural_score, structural_reasoning = _structural_signal(symbol_ids)
+
+    llm_score = base["risk_score"]
+    blended_score = (1 - weight) * llm_score + weight * structural_score
+    threshold = cfg["risk_classifier"]["trivial_threshold"]
+
+    return {
+        "risk_score": blended_score,
+        "risk_reasoning": f"{base.get('risk_reasoning', '')}\n[structural, weight={weight}] {structural_reasoning}",
+        "skip_generation": blended_score < threshold,
     }
 
 

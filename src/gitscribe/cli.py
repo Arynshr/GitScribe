@@ -15,7 +15,13 @@ from pydantic import ValidationError
 from gitscribe import console
 from gitscribe.core import hooks as hook_utils, memory
 from gitscribe.core.analysis import linter as linter_mod
-from gitscribe.core.analysis.rag import answer_query, retrieve
+from gitscribe.core.analysis.diff_symbols import split_diff_by_file
+from gitscribe.core.analysis.rag import (
+    answer_query,
+    retrieve,
+    run_batched_agentic_review,
+    write_agentic_findings_by_file,
+)
 from gitscribe.core.config_schema import GitScribeConfig
 from gitscribe.core.diff_parser import (
     GitCommandError,
@@ -34,7 +40,7 @@ from gitscribe.core.summarizer import summarizer_node
 # usecwd=True: resolve relative to where the command is run, not cli.py's own
 load_dotenv(find_dotenv(usecwd=True))
 
-app = typer.Typer(help="GitScribe: stateful PR description generator (LangGraph-powered)")
+app = typer.Typer(help="GitScribe: A stateful AI-powered Git and code intelligence system")
 
 ENV_PATH = Path(".env")
 repo_hooks_dir = Path(".git") / "hooks"
@@ -366,13 +372,13 @@ def create_pr(
 def index(
     repo_root: str = typer.Option(".", help="Repo root to index"),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output"),
+    force: bool = typer.Option(False, "--force", help="Bypass hash check, full rebuild"),
 ):
-    """Build/refresh the code graph + embeddings. Full rebuild per run
-    (Stage 2 policy) — safe to re-run any time.
+    """Build/refresh the code graph + embeddings. Incremental by default
+    (Merkle hash skip/reuse) — pass --force for a full rebuild.
     """
     config = load_config()  # already a dict — see load_config() docstring
-    index_store.init_schema()
-    warning = index_store.rebuild_index(repo_root, config)
+    result = index_store.reindex(repo_root, config, force=force)
 
     conn = index_store._get_connection()
     symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
@@ -380,14 +386,73 @@ def index(
     resolved_count = conn.execute("SELECT COUNT(*) FROM edges WHERE resolved = 1").fetchone()[0]
     conn.close()
 
-    stats = {"symbols": symbol_count, "edges": edge_count, "resolved_edges": resolved_count}
+    stats = {
+        "symbols": symbol_count,
+        "edges": edge_count,
+        "resolved_edges": resolved_count,
+        "files_changed": result.files_changed,
+        "files_skipped": result.files_skipped,
+        "skipped_entirely": result.skipped_entirely,
+    }
 
     if json_output:
-        typer.echo(json.dumps({**stats, "warning": warning}, indent=2))
+        typer.echo(json.dumps(stats, indent=2))
+    elif result.skipped_entirely:
+        console.info("index unchanged since last run, nothing to do")
     else:
-        console.success(f"indexed {symbol_count} symbols, {edge_count} edges ({resolved_count} resolved)")
-        if warning:
-            console.warn(warning)
+        console.success(
+            f"indexed {symbol_count} symbols, {edge_count} edges ({resolved_count} resolved) "
+            f"— {result.files_changed} file(s) reprocessed, {result.files_skipped} skipped"
+        )
+
+
+@app.command(name="review")
+def review_cmd(
+    lint_only: bool = typer.Option(False, "--lint-only", help="Static pass only, no LLM cost"),
+    as_json: bool = typer.Option(False, "--json", help="Scriptable output"),
+    base: str = typer.Option("origin/main", help="Diff base for the agentic pass"),
+    head: str = typer.Option("HEAD", help="Diff head for the agentic pass"),
+):
+    """Run lint + agentic review, write review_findings, print summary."""
+    config = load_config()
+
+    lint_count = 0
+    if config.get("review", {}).get("lint", {}).get("enabled", True):
+        findings = linter_mod.run_ruff(".")
+        lint_count = linter_mod.write_lint_findings(findings)
+
+    agentic_count = 0
+    if not lint_only and config.get("review", {}).get("agentic", {}).get("enabled", True):
+        try:
+            raw_diff = get_raw_diff(base=base, head=head)
+        except GitCommandError as e:
+            console.warn(f"skipping agentic review, couldn't get diff: {e}")
+            raw_diff = ""
+
+        if raw_diff.strip():
+            # Gate + batch: files with no error-severity lint findings and
+            # low blast radius are skipped entirely (lint's bandit-style
+            # rules already caught anything dangerous on the current
+            # tree); everything else is packed into as few LLM calls as
+            # fit the token budget instead of one call per file.
+            per_file_diffs = split_diff_by_file(raw_diff)
+            try:
+                results, anchors, reviewed_files = run_batched_agentic_review(per_file_diffs, config)
+                agentic_count = write_agentic_findings_by_file(results, anchors)
+                skipped = len(per_file_diffs) - len(reviewed_files)
+                console.info(
+                    f"agentic review: {len(reviewed_files)} file(s) sent to LLM, "
+                    f"{skipped} skipped by gate, {agentic_count} finding(s)"
+                )
+            except Exception as e:
+                console.warn(f"agentic review failed: {e}")
+        else:
+            console.info("empty diff, skipping agentic review (index staleness is a separate condition)")
+
+    if as_json:
+        typer.echo(json.dumps({"lint_findings": lint_count, "agentic_findings": agentic_count}))
+    else:
+        console.success(f"review: {lint_count} lint finding(s), {agentic_count} agentic finding(s)")
 
 
 @app.command()

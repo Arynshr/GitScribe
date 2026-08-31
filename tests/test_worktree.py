@@ -38,9 +38,8 @@ def test_disposable_worktree_yields_path_and_cleans_up_on_success():
 def test_disposable_worktree_cleans_up_even_when_body_raises():
     with patch("gitscribe.core.merge_preview.worktree._run_git"), \
          patch("gitscribe.core.merge_preview.worktree.subprocess.run", return_value=_completed(0)) as mock_run:
-        with pytest.raises(ValueError):
-            with disposable_worktree("HEAD"):
-                raise ValueError("boom")
+        with pytest.raises(ValueError), disposable_worktree("HEAD"):
+            raise ValueError("boom")
         mock_run.assert_called_once()  # cleanup still happened
 
 

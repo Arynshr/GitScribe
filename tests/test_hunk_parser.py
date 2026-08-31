@@ -2,7 +2,11 @@ from unittest.mock import patch
 
 import pytest
 
-from gitscribe.core.merge_preview.hunk_parser import ConflictParseError, hunks_for_file, parse_conflicts
+from gitscribe.core.merge_preview.hunk_parser import (
+    ConflictParseError,
+    hunks_for_file,
+    parse_conflicts,
+)
 
 SIMPLE_CONFLICT = """\
 def greet():
