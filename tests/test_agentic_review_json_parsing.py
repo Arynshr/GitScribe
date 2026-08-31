@@ -66,9 +66,8 @@ def test_bad_output_escalates_to_fallback_model_not_infinite_retry_same_model():
     with patch(
         "gitscribe.core.llm_client.build_chat_model",
         side_effect=_fake_llm(models_called, lambda i: "sorry, I cannot help with that"),
-    ):
-        with pytest.raises(OutputParserException):
-            rag._run_batch_call(BATCH, CFG)
+    ), pytest.raises(OutputParserException):
+        rag._run_batch_call(BATCH, CFG)
 
     assert models_called[0] == "openai/gpt-oss-20b"
     assert "llama-3.1-8b-instant" in models_called[1:]

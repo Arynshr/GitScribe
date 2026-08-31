@@ -8,13 +8,12 @@ from __future__ import annotations
 
 import time
 
-from pydantic import BaseModel, Field
 from langchain_core.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field
 
 from gitscribe.core.analysis.diff_symbols import changed_symbol_ids
-from gitscribe.core.generator import _extract_json_block
-
 from gitscribe.core.failure_router import classify_failure
+from gitscribe.core.generator import _extract_json_block
 from gitscribe.core.indexer.index_store import SearchResult, _get_connection, blast_radius, search
 
 
@@ -229,7 +228,7 @@ def run_agentic_review(
             cleaned = _extract_json_block(ai_msg.content)
             parsed: ReviewFindingsLLM = _REVIEW_PARSER.invoke(cleaned)
             return parsed.findings
-        except Exception as exc:  # noqa: BLE001 — classify via failure_router, don't swallow silently
+        except Exception as exc:
             last_error = exc
             failure_type = classify_failure(str(exc))
             if attempt == max_retries:
@@ -370,7 +369,7 @@ def _run_batch_call(
             cleaned = _extract_json_block(ai_msg.content)
             parsed: _BatchReviewResponse = _BATCH_REVIEW_PARSER.invoke(cleaned)
             return parsed.findings
-        except Exception as exc:  # noqa: BLE001 — same classify-don't-swallow pattern as run_agentic_review
+        except Exception as exc:
             last_error = exc
             failure_type = classify_failure(str(exc))
             if attempt == max_retries:

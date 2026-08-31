@@ -2,7 +2,6 @@
 """
 
 import ast
-import inspect
 from pathlib import Path
 
 CLI_PATH = Path(__file__).parent.parent / "src" / "gitscribe" / "cli.py"
