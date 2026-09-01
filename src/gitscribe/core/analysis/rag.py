@@ -15,6 +15,7 @@ from gitscribe.core.analysis.diff_symbols import changed_symbol_ids
 from gitscribe.core.failure_router import classify_failure
 from gitscribe.core.generator import _extract_json_block
 from gitscribe.core.indexer.index_store import SearchResult, _get_connection, blast_radius, search
+from gitscribe.core.telemetry import logger
 
 
 class ContextSnippet(BaseModel):
@@ -415,10 +416,27 @@ def run_batched_agentic_review(
             # fall back to the single-file path, which truncates as a
             # last resort instead of failing the whole batch.
             file, diff_text, symbol_ids = batch[0]
-            results[file] = run_agentic_review(diff_text, symbol_ids, cfg)
+            try:
+                results[file] = run_agentic_review(diff_text, symbol_ids, cfg)
+            except Exception as exc:
+                logger.warning("agentic review failed for %s, skipping: %s", file, exc)
             continue
 
-        findings = _run_batch_call(batch, cfg)
+        # One batch exhausting its retries (e.g. persistent malformed-JSON
+        # output) must not discard every other batch's already-accumulated
+        # results — this used to propagate straight out of the function,
+        # so cli.py's broad `except Exception` around the whole call would
+        # report 0 findings even when most batches had already succeeded.
+        try:
+            findings = _run_batch_call(batch, cfg)
+        except Exception as exc:
+            failed_files = [c[0] for c in batch]
+            logger.warning(
+                "agentic review batch failed (%d file(s): %s), skipping: %s",
+                len(failed_files), ", ".join(failed_files), exc,
+            )
+            continue
+
         for f in findings:
             results.setdefault(f.file, []).append(
                 ReviewFindingLLM(
