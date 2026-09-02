@@ -197,7 +197,7 @@ def run_agentic_review(
 
     review_cfg = cfg.get("review", {}).get("agentic", {})
     hops = review_cfg.get("hops", 2)
-    max_context_tokens = review_cfg.get("max_context_tokens", 6000)
+    max_context_tokens = review_cfg.get("max_context_tokens", 8000)
     max_retries = cfg.get("failure_handling", {}).get("max_retries", 2)
 
     diff_budget = int(max_context_tokens * 0.6)  # leave room for context + prompt scaffolding
