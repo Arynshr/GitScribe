@@ -2,7 +2,8 @@
 Deterministic node: prompt construction + LLM call + structured parsing.
 This is the README's core 'chain' — no agent behavior, single call.
 """
-import re
+
+import json
 
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -49,16 +50,56 @@ Respond with ONLY the JSON object. No preamble, no explanation, no markdown \
 fence around it — just the raw JSON, starting with {{ and ending with }}."""
 )
 
-# Instruction-tuned models (esp. smaller ones like fallback 8B models) commonly
-# ignore "JSON only" instructions and add a sentence before/after it anyway.
-# Extracting the first balanced {...} block makes parsing robust to that instead
-# of depending entirely on the model following instructions perfectly.
-_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+def _find_balanced_end(text: str, start: int) -> int | None:
+    """Index of the closing '}' matching the '{' at `start`, scanning
+    brace depth string-aware (a brace inside a quoted JSON string value
+    doesn't affect depth). None if never balanced."""
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
 
 
 def _extract_json_block(text: str) -> str:
-    match = _JSON_BLOCK_RE.search(text)
-    return match.group(0) if match else text
+    first_candidate: str | None = None
+    pos = 0
+    while True:
+        start = text.find("{", pos)
+        if start == -1:
+            break
+        end = _find_balanced_end(text, start)
+        if end is None:
+            break  # unbalanced from here on -- nothing further to try
+        candidate = text[start : end + 1]
+        if first_candidate is None:
+            first_candidate = candidate
+        try:
+            json.loads(candidate)
+            return candidate
+        except ValueError:
+            pos = end + 1  # not valid JSON on its own -- try the next candidate
+    # nothing parsed cleanly; return the first balanced group (if any) so
+    # the caller's parser still raises a specific, readable error instead
+    # of choking on unrelated raw text
+    return first_candidate if first_candidate is not None else text
 
 
 def generator_node(state: GitScribeState, cfg: dict) -> dict:

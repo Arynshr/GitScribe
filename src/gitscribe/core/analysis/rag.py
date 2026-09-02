@@ -8,14 +8,14 @@ from __future__ import annotations
 
 import time
 
-from pydantic import BaseModel, Field
 from langchain_core.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field
 
 from gitscribe.core.analysis.diff_symbols import changed_symbol_ids
-from gitscribe.core.generator import _extract_json_block
-
 from gitscribe.core.failure_router import classify_failure
+from gitscribe.core.generator import _extract_json_block
 from gitscribe.core.indexer.index_store import SearchResult, _get_connection, blast_radius, search
+from gitscribe.core.telemetry import logger
 
 
 class ContextSnippet(BaseModel):
@@ -197,7 +197,7 @@ def run_agentic_review(
 
     review_cfg = cfg.get("review", {}).get("agentic", {})
     hops = review_cfg.get("hops", 2)
-    max_context_tokens = review_cfg.get("max_context_tokens", 6000)
+    max_context_tokens = review_cfg.get("max_context_tokens", 8000)
     max_retries = cfg.get("failure_handling", {}).get("max_retries", 2)
 
     diff_budget = int(max_context_tokens * 0.6)  # leave room for context + prompt scaffolding
@@ -229,7 +229,7 @@ def run_agentic_review(
             cleaned = _extract_json_block(ai_msg.content)
             parsed: ReviewFindingsLLM = _REVIEW_PARSER.invoke(cleaned)
             return parsed.findings
-        except Exception as exc:  # noqa: BLE001 — classify via failure_router, don't swallow silently
+        except Exception as exc:
             last_error = exc
             failure_type = classify_failure(str(exc))
             if attempt == max_retries:
@@ -370,7 +370,7 @@ def _run_batch_call(
             cleaned = _extract_json_block(ai_msg.content)
             parsed: _BatchReviewResponse = _BATCH_REVIEW_PARSER.invoke(cleaned)
             return parsed.findings
-        except Exception as exc:  # noqa: BLE001 — same classify-don't-swallow pattern as run_agentic_review
+        except Exception as exc:
             last_error = exc
             failure_type = classify_failure(str(exc))
             if attempt == max_retries:
@@ -416,10 +416,27 @@ def run_batched_agentic_review(
             # fall back to the single-file path, which truncates as a
             # last resort instead of failing the whole batch.
             file, diff_text, symbol_ids = batch[0]
-            results[file] = run_agentic_review(diff_text, symbol_ids, cfg)
+            try:
+                results[file] = run_agentic_review(diff_text, symbol_ids, cfg)
+            except Exception as exc:
+                logger.warning("agentic review failed for %s, skipping: %s", file, exc)
             continue
 
-        findings = _run_batch_call(batch, cfg)
+        # One batch exhausting its retries (e.g. persistent malformed-JSON
+        # output) must not discard every other batch's already-accumulated
+        # results — this used to propagate straight out of the function,
+        # so cli.py's broad `except Exception` around the whole call would
+        # report 0 findings even when most batches had already succeeded.
+        try:
+            findings = _run_batch_call(batch, cfg)
+        except Exception as exc:
+            failed_files = [c[0] for c in batch]
+            logger.warning(
+                "agentic review batch failed (%d file(s): %s), skipping: %s",
+                len(failed_files), ", ".join(failed_files), exc,
+            )
+            continue
+
         for f in findings:
             results.setdefault(f.file, []).append(
                 ReviewFindingLLM(

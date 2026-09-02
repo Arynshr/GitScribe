@@ -68,6 +68,30 @@ class ReviewConfig(BaseModel):
     agentic: AgenticReviewConfig = AgenticReviewConfig()
 
 
+class PrePushHookConfig(BaseModel):
+    block_on_risk: bool = False
+
+
+class MergeCheckHookConfig(BaseModel):
+    block_on_risk: bool = False
+
+
+class PostMergeHookConfig(BaseModel):
+    auto_tag: bool = False
+    push_tag: bool = False
+
+
+class CommitMsgHookConfig(BaseModel):
+    enabled: bool = True
+
+
+class HooksConfig(BaseModel):
+    pre_push: PrePushHookConfig = PrePushHookConfig()
+    merge_check: MergeCheckHookConfig = MergeCheckHookConfig()
+    post_merge: PostMergeHookConfig = PostMergeHookConfig()
+    commit_msg: CommitMsgHookConfig = CommitMsgHookConfig()
+
+
 class GitScribeConfig(BaseModel):
     llm: LLMConfig
     retrieval: RetrievalConfig = RetrievalConfig()
@@ -76,6 +100,7 @@ class GitScribeConfig(BaseModel):
     embedding: EmbeddingConfig = EmbeddingConfig()
     merge_preview: MergePreviewConfig = MergePreviewConfig()
     review: ReviewConfig = ReviewConfig()
+    hooks: HooksConfig = HooksConfig()
     ignore_patterns: list[str] = Field(default_factory=list)
 
     def as_dict(self) -> dict:
